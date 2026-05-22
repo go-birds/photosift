@@ -1,0 +1,15 @@
+# Build artifacts
+/photosift
+*.db
+*.db-wal
+*.db-shm
+
+# Analysis / export outputs
+labels.json
+photosift-delete.json
+photosift-delete.csv
+
+# Node automation
+automation/node_modules/
+automation/.gphotos-profile/
+automation/manual-review.json

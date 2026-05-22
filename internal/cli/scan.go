@@ -2,7 +2,7 @@
 
 package cli
 
-import(
+import (
 	"database/sql"
 	"fmt"
 	"os"
@@ -30,10 +30,10 @@ func defaultDBPath() string {
 }
 
 var scanCmd = &cobra.Command{
-	Use: "scan [path...]",
+	Use:   "scan [path...]",
 	Short: "Scan one or more directories and index images",
-	Args: cobra.MinimumNArgs(1),
-	RunE: func(cmd *cobra.Command,args []string) error {
+	Args:  cobra.MinimumNArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
 		start := time.Now()
 
 		if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
@@ -50,12 +50,13 @@ var scanCmd = &cobra.Command{
 			return fmt.Errorf("init schema: %w", err)
 		}
 
-		count, err := ingest.ScanPaths(db, args)
+		res, err := ingest.ScanPaths(db, args)
 		if err != nil {
 			return err
 		}
 
-		fmt.Printf("scanned %d images in %s\n", count, time.Since(start))
+		fmt.Printf("scanned %d images (%d skipped unchanged) in %s\n", res.Scanned, res.Skipped, time.Since(start))
+		fmt.Printf("indexed %d images total\n", res.Total)
 		fmt.Printf("db: %s\n", dbPath)
 		return nil
 	},

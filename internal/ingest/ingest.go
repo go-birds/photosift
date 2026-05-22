@@ -3,6 +3,7 @@ package ingest
 import (
 	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"image"
 	_ "image/gif"
@@ -11,11 +12,17 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"github.com/go-birds/photosift/internal/takeout"
 )
 
+// schemaSQL creates a fresh database. Existing databases are upgraded by
+// ensureColumns so older scans keep working.
 const schemaSQL = `
 CREATE TABLE IF NOT EXISTS images (
   id INTEGER PRIMARY KEY,
@@ -24,15 +31,100 @@ CREATE TABLE IF NOT EXISTS images (
   dhash INTEGER NOT NULL,
   size_bytes INTEGER NOT NULL,
   mtime_unix INTEGER NOT NULL,
-  scanned_at_unix INTEGER NOT NULL
+  scanned_at_unix INTEGER NOT NULL,
+  width INTEGER NOT NULL DEFAULT 0,
+  height INTEGER NOT NULL DEFAULT 0,
+  blur_var REAL NOT NULL DEFAULT 0,
+  brightness REAL NOT NULL DEFAULT 0,
+  colorfulness REAL NOT NULL DEFAULT 0,
+  taken_at_unix INTEGER NOT NULL DEFAULT 0,
+  gphotos_url TEXT NOT NULL DEFAULT '',
+  content_label TEXT NOT NULL DEFAULT '',
+  content_score REAL NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_images_sha256 ON images(sha256);
 CREATE INDEX IF NOT EXISTS idx_images_dhash ON images(dhash);
+
+CREATE TABLE IF NOT EXISTS suggestions (
+  id INTEGER PRIMARY KEY,
+  image_id INTEGER NOT NULL,
+  category TEXT NOT NULL,
+  score REAL NOT NULL,
+  reason TEXT NOT NULL,
+  cluster_id INTEGER NOT NULL DEFAULT 0,
+  is_keeper INTEGER NOT NULL DEFAULT 0,
+  UNIQUE(image_id, category)
+);
+CREATE INDEX IF NOT EXISTS idx_sugg_category ON suggestions(category);
+CREATE INDEX IF NOT EXISTS idx_sugg_cluster ON suggestions(cluster_id);
+
+CREATE TABLE IF NOT EXISTS decisions (
+  image_id INTEGER PRIMARY KEY,
+  action TEXT NOT NULL,
+  decided_at_unix INTEGER NOT NULL
+);
 `
 
+// upgradeColumns are added to pre-existing image tables that predate the
+// analysis feature.
+var upgradeColumns = map[string]string{
+	"width":         "INTEGER NOT NULL DEFAULT 0",
+	"height":        "INTEGER NOT NULL DEFAULT 0",
+	"blur_var":      "REAL NOT NULL DEFAULT 0",
+	"brightness":    "REAL NOT NULL DEFAULT 0",
+	"colorfulness":  "REAL NOT NULL DEFAULT 0",
+	"taken_at_unix": "INTEGER NOT NULL DEFAULT 0",
+	"gphotos_url":   "TEXT NOT NULL DEFAULT ''",
+	"content_label": "TEXT NOT NULL DEFAULT ''",
+	"content_score": "REAL NOT NULL DEFAULT 0",
+}
+
+// EnsureSchema creates tables, migrates old ones, and applies the pragmas that
+// matter for bulk-write throughput.
 func EnsureSchema(db *sql.DB) error {
-	_, err := db.Exec(schemaSQL)
-	return err
+	for _, p := range []string{
+		"PRAGMA journal_mode=WAL;",
+		"PRAGMA synchronous=NORMAL;",
+		"PRAGMA temp_store=MEMORY;",
+		"PRAGMA busy_timeout=5000;",
+	} {
+		if _, err := db.Exec(p); err != nil {
+			return fmt.Errorf("pragma %q: %w", p, err)
+		}
+	}
+	if _, err := db.Exec(schemaSQL); err != nil {
+		return err
+	}
+	return ensureColumns(db)
+}
+
+func ensureColumns(db *sql.DB) error {
+	rows, err := db.Query(`PRAGMA table_info(images)`)
+	if err != nil {
+		return err
+	}
+	have := map[string]bool{}
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt any
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			rows.Close()
+			return err
+		}
+		have[name] = true
+	}
+	rows.Close()
+
+	for col, def := range upgradeColumns {
+		if !have[col] {
+			if _, err := db.Exec(fmt.Sprintf("ALTER TABLE images ADD COLUMN %s %s", col, def)); err != nil {
+				return fmt.Errorf("add column %s: %w", col, err)
+			}
+		}
+	}
+	return nil
 }
 
 var exts = map[string]bool{
@@ -40,42 +132,84 @@ var exts = map[string]bool{
 	".jpeg": true,
 	".png":  true,
 	".gif":  true,
-	".webp": true, // may not decode unless extra libs; we’ll skip if decode fails
+	".webp": true, // decoded only if the build includes a webp decoder
 }
 
-func ScanPaths(db *sql.DB, roots []string) (int, error) {
-	pathsCh := make(chan string, 512)
-	errCh := make(chan error, 16)
+// record is a fully computed row handed from a worker to the DB writer.
+type record struct {
+	path                      string
+	sha256                    string
+	metrics                   Metrics
+	sizeBytes, mtime, takenAt int64
+	gphotosURL                string
+}
 
-	workerCount := 8
+// existing lets workers skip files whose size+mtime are unchanged since the
+// last scan, avoiding the expensive decode entirely.
+type existing struct {
+	size  int64
+	mtime int64
+}
+
+// ScanResult reports what a scan did.
+type ScanResult struct {
+	Scanned int // files processed (decoded + written)
+	Skipped int // unchanged files skipped
+	Total   int // rows in the table afterward
+}
+
+// ScanPaths walks roots, computes metrics for new/changed images in parallel,
+// and writes them through a single batched writer goroutine. It returns once
+// every file has been handled.
+func ScanPaths(db *sql.DB, roots []string) (ScanResult, error) {
+	prior, err := loadExisting(db)
+	if err != nil {
+		return ScanResult{}, fmt.Errorf("load existing: %w", err)
+	}
+
+	pathsCh := make(chan string, 1024)
+	recCh := make(chan record, 1024)
+
+	var scanned, skipped int64
+	workerCount := runtime.NumCPU()
+	if workerCount < 1 {
+		workerCount = 1
+	}
+
 	var wg sync.WaitGroup
 	wg.Add(workerCount)
-
 	for i := 0; i < workerCount; i++ {
 		go func() {
 			defer wg.Done()
 			for p := range pathsCh {
-				if err := processOne(db, p); err != nil {
-					// non-fatal: log and continue by sending to errCh
-					errCh <- fmt.Errorf("%s: %w", p, err)
+				rec, ok, err := processOne(p, prior)
+				if err != nil {
+					fmt.Fprintln(os.Stderr, "scan warning:", p, err)
+					continue
 				}
+				if !ok {
+					atomic.AddInt64(&skipped, 1)
+					continue
+				}
+				atomic.AddInt64(&scanned, 1)
+				recCh <- rec
 			}
 		}()
 	}
+
+	// writer goroutine: single SQLite writer, batched into transactions.
+	writerDone := make(chan error, 1)
+	go func() { writerDone <- writeRecords(db, recCh) }()
 
 	// walk producers
 	go func() {
 		defer close(pathsCh)
 		for _, r := range roots {
 			_ = filepath.WalkDir(r, func(path string, d os.DirEntry, err error) error {
-				if err != nil {
+				if err != nil || d.IsDir() {
 					return nil
 				}
-				if d.IsDir() {
-					return nil
-				}
-				ext := strings.ToLower(filepath.Ext(d.Name()))
-				if exts[ext] {
+				if exts[strings.ToLower(filepath.Ext(d.Name()))] {
 					pathsCh <- path
 				}
 				return nil
@@ -83,78 +217,144 @@ func ScanPaths(db *sql.DB, roots []string) (int, error) {
 		}
 	}()
 
-	// close errCh after workers done
-	go func() {
-		wg.Wait()
-		close(errCh)
-	}()
-
-	var processed int
-	for err := range errCh {
-		// We treat decode errors as noise; print and keep going.
-		fmt.Fprintln(os.Stderr, "scan warning:", err)
+	wg.Wait()
+	close(recCh)
+	if werr := <-writerDone; werr != nil {
+		return ScanResult{}, werr
 	}
 
-	// processed count = rows inserted/updated; compute via query
-	// (simple + accurate) — count rows in db for now? That’s global.
-	// For MVP, just return a best-effort count by scanning roots again would be slow.
-	// We'll instead track a local counter in-process by counting successful inserts in processOne.
-	// So: processed is updated in processOne via return value. We'll do a simpler approach:
-	// We'll just return 0 here and print warnings; not great.
-
-	// Better: quick query count of records.
-	row := db.QueryRow(`SELECT COUNT(*) FROM images;`)
-	_ = row.Scan(&processed)
-
-	return processed, nil
+	var total int
+	_ = db.QueryRow(`SELECT COUNT(*) FROM images`).Scan(&total)
+	return ScanResult{
+		Scanned: int(atomic.LoadInt64(&scanned)),
+		Skipped: int(atomic.LoadInt64(&skipped)),
+		Total:   total,
+	}, nil
 }
 
-func processOne(db *sql.DB, path string) error {
+func loadExisting(db *sql.DB) (map[string]existing, error) {
+	rows, err := db.Query(`SELECT path, size_bytes, mtime_unix FROM images`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]existing{}
+	for rows.Next() {
+		var p string
+		var sz, mt int64
+		if err := rows.Scan(&p, &sz, &mt); err != nil {
+			return nil, err
+		}
+		out[p] = existing{size: sz, mtime: mt}
+	}
+	return out, rows.Err()
+}
+
+// processOne computes a record for a single image, or returns ok=false when the
+// file is unchanged since the last scan and can be skipped.
+func processOne(path string, prior map[string]existing) (record, bool, error) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return record{}, false, err
+	}
+	if e, ok := prior[path]; ok && e.size == fi.Size() && e.mtime == fi.ModTime().Unix() {
+		return record{}, false, nil
+	}
+
 	f, err := os.Open(path)
 	if err != nil {
-		return err
+		return record{}, false, err
 	}
 	defer f.Close()
 
-	st, err := f.Stat()
-	if err != nil {
-		return err
-	}
-
 	sha, err := sha256File(f)
 	if err != nil {
-		return err
+		return record{}, false, err
 	}
-
-	// reset for decode
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		return err
+		return record{}, false, err
 	}
 
 	img, _, err := image.Decode(f)
 	if err != nil {
-		return err
+		return record{}, false, err
 	}
 
-	dh := dHash(img)
+	rec := record{
+		path:      path,
+		sha256:    sha,
+		metrics:   computeMetrics(img),
+		sizeBytes: fi.Size(),
+		mtime:     fi.ModTime().Unix(),
+		takenAt:   fi.ModTime().Unix(),
+	}
+	if meta, ok := takeout.SidecarFor(path); ok {
+		if meta.TakenAtUnix > 0 {
+			rec.takenAt = meta.TakenAtUnix
+		}
+		rec.gphotosURL = meta.URL
+	}
+	return rec, true, nil
+}
 
-	_, err = db.Exec(
-		`INSERT INTO images(path, sha256, dhash, size_bytes, mtime_unix, scanned_at_unix)
-		 VALUES(?, ?, ?, ?, ?, ?)
-		 ON CONFLICT(path) DO UPDATE SET
-		   sha256=excluded.sha256,
-		   dhash=excluded.dhash,
-		   size_bytes=excluded.size_bytes,
-		   mtime_unix=excluded.mtime_unix,
-		   scanned_at_unix=excluded.scanned_at_unix;`,
-		path,
-		sha,
-		int64(dh),
-		st.Size(),
-		st.ModTime().Unix(),
-		time.Now().Unix(),
-	)
-	return err
+const batchSize = 500
+
+func writeRecords(db *sql.DB, recCh <-chan record) error {
+	const stmt = `INSERT INTO images
+	  (path, sha256, dhash, size_bytes, mtime_unix, scanned_at_unix,
+	   width, height, blur_var, brightness, colorfulness, taken_at_unix, gphotos_url)
+	 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	 ON CONFLICT(path) DO UPDATE SET
+	   sha256=excluded.sha256, dhash=excluded.dhash,
+	   size_bytes=excluded.size_bytes, mtime_unix=excluded.mtime_unix,
+	   scanned_at_unix=excluded.scanned_at_unix, width=excluded.width,
+	   height=excluded.height, blur_var=excluded.blur_var,
+	   brightness=excluded.brightness, colorfulness=excluded.colorfulness,
+	   taken_at_unix=excluded.taken_at_unix, gphotos_url=excluded.gphotos_url`
+
+	now := time.Now().Unix()
+	batch := make([]record, 0, batchSize)
+
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		tx, err := db.Begin()
+		if err != nil {
+			return err
+		}
+		ps, err := tx.Prepare(stmt)
+		if err != nil {
+			tx.Rollback()
+			return err
+		}
+		for _, r := range batch {
+			if _, err := ps.Exec(r.path, r.sha256, int64(r.metrics.Dhash),
+				r.sizeBytes, r.mtime, now, r.metrics.Width, r.metrics.Height,
+				r.metrics.BlurVar, r.metrics.Brightness, r.metrics.Colorfulness,
+				r.takenAt, r.gphotosURL); err != nil {
+				ps.Close()
+				tx.Rollback()
+				return err
+			}
+		}
+		ps.Close()
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+		batch = batch[:0]
+		return nil
+	}
+
+	for r := range recCh {
+		batch = append(batch, r)
+		if len(batch) >= batchSize {
+			if err := flush(); err != nil {
+				return err
+			}
+		}
+	}
+	return flush()
 }
 
 func sha256File(r io.Reader) (string, error) {
@@ -162,44 +362,5 @@ func sha256File(r io.Reader) (string, error) {
 	if _, err := io.Copy(h, r); err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("%x", h.Sum(nil)), nil
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
-
-// dHash: 8x8 comparisons = 64-bit hash
-func dHash(img image.Image) uint64 {
-	const w = 9
-	const h = 8
-
-	b := img.Bounds()
-	dx := b.Dx()
-	dy := b.Dy()
-
-	// sample 9x8 into luminance array
-	var lum [h][w]uint8
-	for y := 0; y < h; y++ {
-		for x := 0; x < w; x++ {
-			sx := b.Min.X + (x*dx)/w
-			sy := b.Min.Y + (y*dy)/h
-			r, g, bl, _ := img.At(sx, sy).RGBA()
-			// convert to 8-bit luminance
-			rr := float64(r) / 65535.0
-			gg := float64(g) / 65535.0
-			bb := float64(bl) / 65535.0
-			yv := 0.299*rr + 0.587*gg + 0.114*bb
-			lum[y][x] = uint8(yv * 255.0)
-		}
-	}
-
-	var out uint64
-	var bit uint
-	for y := 0; y < h; y++ {
-		for x := 0; x < w-1; x++ {
-			if lum[y][x] > lum[y][x+1] {
-				out |= 1 << bit
-			}
-			bit++
-		}
-	}
-	return out
-}
-

@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>PhotoSift — review deletions</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header>
+    <h1>PhotoSift</h1>
+    <p class="sub">Review suggested deletions. Nothing is deleted here — mark photos, then export the list or run the deleter.</p>
+  </header>
+
+  <nav id="tabs"></nav>
+
+  <main>
+    <div id="toolbar" class="toolbar">
+      <span id="count" class="count"></span>
+      <div class="spacer"></div>
+      <button id="select-all" class="btn">Mark all suggestions for deletion</button>
+      <a id="export-csv" class="btn" href="/api/export.csv">Export CSV</a>
+      <a id="export-json" class="btn" href="/api/export.json">Export JSON</a>
+    </div>
+    <div id="groups"></div>
+    <div id="empty" class="empty hidden">No suggestions in this category.</div>
+  </main>
+
+  <div id="lightbox" class="lightbox hidden">
+    <img id="lightbox-img" alt="" />
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
