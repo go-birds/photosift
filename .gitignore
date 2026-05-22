@@ -13,3 +13,10 @@ photosift-delete.csv
 automation/node_modules/
 automation/.gphotos-profile/
 automation/manual-review.json
+
+# Wails / desktop app build output
+wails/build/bin/
+wails/PhotoSift.app/
+
+# stray local build of the wails main package
+wails/wails

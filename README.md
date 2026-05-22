@@ -86,11 +86,17 @@ Useful flags: `analyze --near-dist`, `--subject-min`, `--blur-threshold`;
   fast on large libraries instead of comparing every pair.
 - Workers scale to `NumCPU`.
 
-## Packaging as a Mac app
+## Mac app
 
-`photosift serve` is the desktop experience: a single Go binary that serves a
-self-contained web UI on localhost. To ship it as a clickable `.app`, wrap the
-binary so it launches `serve` and opens the browser — e.g. a minimal
-[Wails](https://wails.io) shell or an Automator/`.app` launcher. The web assets
-are embedded in the binary (`go:embed`), so there are no external files to
-bundle.
+A clickable `PhotoSift.app` lives in [`wails/`](wails/). It renders this same UI
+in a native window and shares the CLI database (`~/.photosift/photosift.db`).
+Two build paths are provided:
+
+- **Native window (Wails):** `cd wails && ./build.sh` — reuses `internal/server`
+  as the Wails asset handler, so there's no duplicated frontend. Requires a Mac
+  with the Wails toolchain.
+- **No toolchain:** `cd wails && ./build-app-from-cli.sh` — bundles the plain Go
+  binary into a `.app` that runs `serve` and opens your browser.
+
+See [`wails/README.md`](wails/README.md) for details. The web assets are
+embedded in the binary (`go:embed`), so there are no loose files to ship.
