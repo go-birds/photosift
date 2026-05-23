@@ -89,7 +89,6 @@ function makeCard(img) {
     await postDecision(img.id, next);
     img.decision = next === "clear" ? "" : "delete";
     refreshCardState(card, del, keep, img);
-    loadSummary();
   };
 
   const keep = document.createElement("button");
@@ -100,7 +99,6 @@ function makeCard(img) {
     await postDecision(img.id, next);
     img.decision = next === "clear" ? "" : "keep";
     refreshCardState(card, del, keep, img);
-    loadSummary();
   };
 
   actions.appendChild(del);
@@ -151,12 +149,7 @@ async function loadGroups() {
 }
 
 async function loadSummary() {
-  const s = await getJSON("/api/summary");
-  counts = s.counts || {};
-  renderTabs();
-  const decidedText = s.decided ? ` · ${s.decided} decided so far` : "";
-  document.getElementById("count").textContent =
-    `${s.candidates} of ${s.total} photos suggested for deletion${decidedText}`;
+  applySummary(await getJSON("/api/summary"));
 }
 
 function showLightbox(id) {
@@ -203,7 +196,6 @@ function exitReview() {
   document.getElementById("review-panel").classList.add("hidden");
   document.getElementById("groups").classList.remove("hidden");
   loadGroups();
-  loadSummary();
 }
 
 function renderReview() {
@@ -312,13 +304,11 @@ document.addEventListener("keydown", async (e) => {
     e.preventDefault();
     snapshot();
     await applyDefault(g);
-    loadSummary();
     reviewNext();
   } else if (e.key === "k" || e.key === "K") {
     e.preventDefault();
     snapshot();
     await keepAll(g);
-    loadSummary();
     reviewNext();
   } else if (e.key === "ArrowRight") {
     e.preventDefault();
@@ -329,7 +319,6 @@ document.addEventListener("keydown", async (e) => {
   } else if (e.key === "u" || e.key === "U") {
     e.preventDefault();
     await undo();
-    loadSummary();
   }
 });
 
@@ -341,10 +330,35 @@ document.getElementById("select-all").onclick = async () => {
       if (!img.is_keeper) ids.push(img.id);
   await Promise.all(ids.map((id) => postDecision(id, "delete")));
   await loadGroups();
-  await loadSummary();
 };
+
+// applySummary updates the toolbar count and tab badges from a summary object.
+// Used by both the initial fetch and every SSE push.
+function applySummary(s) {
+  counts = s.counts || {};
+  renderTabs();
+  const decidedText = s.decided ? ` · ${s.decided} decided so far` : "";
+  document.getElementById("count").textContent =
+    `${s.candidates} of ${s.total} photos suggested for deletion${decidedText}`;
+}
+
+// connectEvents opens an SSE stream and reapplies the summary on every push.
+// The server sends one immediately on connect, then again after every decision
+// change, so the UI stays current without explicit polling.
+function connectEvents() {
+  const es = new EventSource("/api/events");
+  es.onmessage = (e) => {
+    try {
+      applySummary(JSON.parse(e.data));
+    } catch {
+      // ignore malformed frames; next event will arrive.
+    }
+  };
+  // EventSource auto-reconnects on transient errors; nothing to do here.
+}
 
 (async function init() {
   await loadSummary();
   await loadGroups();
+  connectEvents();
 })();

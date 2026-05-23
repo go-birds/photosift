@@ -32,11 +32,44 @@ type Server struct {
 	db        *sql.DB
 	thumbs    sync.Map // id -> []byte (jpeg)
 	thumbSide int
+
+	// SSE subscribers fanning out summary updates whenever a decision
+	// changes. Local app, single user — a tiny hub is plenty.
+	subsMu sync.Mutex
+	subs   map[chan struct{}]struct{}
 }
 
 // New builds a server backed by the given database handle.
 func New(db *sql.DB) *Server {
-	return &Server{db: db, thumbSide: 320}
+	return &Server{db: db, thumbSide: 320, subs: map[chan struct{}]struct{}{}}
+}
+
+func (s *Server) subscribe() chan struct{} {
+	ch := make(chan struct{}, 1)
+	s.subsMu.Lock()
+	s.subs[ch] = struct{}{}
+	s.subsMu.Unlock()
+	return ch
+}
+
+func (s *Server) unsubscribe(ch chan struct{}) {
+	s.subsMu.Lock()
+	delete(s.subs, ch)
+	s.subsMu.Unlock()
+}
+
+// notify wakes every subscriber without blocking. A buffered channel of 1 means
+// the wake-up is coalesced — multiple writes between flushes collapse to one
+// pending notification.
+func (s *Server) notify() {
+	s.subsMu.Lock()
+	defer s.subsMu.Unlock()
+	for ch := range s.subs {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
 }
 
 // Handler returns the HTTP handler for the whole app.
@@ -51,6 +84,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/thumb/", s.handleThumb)
 	mux.HandleFunc("/api/image/", s.handleImage)
 	mux.HandleFunc("/api/decision", s.handleDecision)
+	mux.HandleFunc("/api/events", s.handleEvents)
 	mux.HandleFunc("/api/export.csv", s.handleExportCSV)
 	mux.HandleFunc("/api/export.json", s.handleExportJSON)
 	return mux
@@ -81,11 +115,10 @@ func writeJSON(w http.ResponseWriter, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-func (s *Server) handleSummary(w http.ResponseWriter, r *http.Request) {
+func (s *Server) summary() (map[string]any, error) {
 	rows, err := s.db.Query(`SELECT category, COUNT(*) FROM suggestions WHERE is_keeper=0 GROUP BY category`)
 	if err != nil {
-		http.Error(w, err.Error(), 500)
-		return
+		return nil, err
 	}
 	defer rows.Close()
 	counts := map[string]int{}
@@ -93,8 +126,7 @@ func (s *Server) handleSummary(w http.ResponseWriter, r *http.Request) {
 		var c string
 		var n int
 		if err := rows.Scan(&c, &n); err != nil {
-			http.Error(w, err.Error(), 500)
-			return
+			return nil, err
 		}
 		counts[c] = n
 	}
@@ -103,13 +135,64 @@ func (s *Server) handleSummary(w http.ResponseWriter, r *http.Request) {
 	_ = s.db.QueryRow(`SELECT COUNT(*) FROM images`).Scan(&total)
 	_ = s.db.QueryRow(`SELECT COUNT(DISTINCT image_id) FROM suggestions WHERE is_keeper=0`).Scan(&candidates)
 	_ = s.db.QueryRow(`SELECT COUNT(*) FROM decisions`).Scan(&decided)
-
-	writeJSON(w, map[string]any{
+	return map[string]any{
 		"total":      total,
 		"candidates": candidates,
 		"decided":    decided,
 		"counts":     counts,
-	})
+	}, nil
+}
+
+func (s *Server) handleSummary(w http.ResponseWriter, r *http.Request) {
+	sum, err := s.summary()
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	writeJSON(w, sum)
+}
+
+// handleEvents is a Server-Sent Events stream. Whenever a decision changes,
+// every connected client gets a fresh summary pushed — no polling, no
+// per-click GETs. SSE was chosen over WebSocket because the traffic is
+// strictly one-way and SSE works through proxies without negotiation.
+func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", 500)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no") // disable proxy buffering if any
+
+	ch := s.subscribe()
+	defer s.unsubscribe(ch)
+
+	// Push the current summary immediately so the client doesn't need a
+	// separate /api/summary fetch on connect.
+	send := func() {
+		sum, err := s.summary()
+		if err != nil {
+			return
+		}
+		data, _ := json.Marshal(sum)
+		_, _ = w.Write([]byte("data: "))
+		_, _ = w.Write(data)
+		_, _ = w.Write([]byte("\n\n"))
+		flusher.Flush()
+	}
+	send()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-ch:
+			send()
+		}
+	}
 }
 
 func (s *Server) handleGroups(w http.ResponseWriter, r *http.Request) {
@@ -265,6 +348,7 @@ func (s *Server) handleDecision(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), 500)
 			return
 		}
+		s.notify()
 		writeJSON(w, map[string]string{"status": "ok"})
 		return
 	}
@@ -280,6 +364,7 @@ func (s *Server) handleDecision(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 500)
 		return
 	}
+	s.notify()
 	writeJSON(w, map[string]string{"status": "ok"})
 }
 
