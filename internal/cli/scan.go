@@ -56,6 +56,9 @@ var scanCmd = &cobra.Command{
 		}
 
 		fmt.Printf("scanned %d images (%d skipped unchanged) in %s\n", res.Scanned, res.Skipped, time.Since(start))
+		if res.Failed > 0 {
+			fmt.Printf("  %d files could not be decoded (e.g. HEIC or truncated)\n", res.Failed)
+		}
 		fmt.Printf("indexed %d images total\n", res.Total)
 		fmt.Printf("db: %s\n", dbPath)
 		return nil

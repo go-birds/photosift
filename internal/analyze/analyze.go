@@ -88,9 +88,10 @@ func Run(db *sql.DB, opts Options) (Summary, error) {
 	var sugs []Suggestion
 	var cluster int64
 
+	hashIdx := newHashIndex(imgs)
 	cluster = detectExactDup(imgs, &sugs, cluster)
-	cluster = detectNearDup(imgs, opts, &sugs, cluster)
-	cluster = detectOvershoot(imgs, opts, &sugs, cluster)
+	cluster = detectNearDup(imgs, hashIdx, opts, &sugs, cluster)
+	cluster = detectOvershoot(imgs, hashIdx, opts, &sugs, cluster)
 	detectLowQuality(imgs, opts, &sugs)
 	detectUseless(imgs, opts, &sugs)
 
@@ -149,8 +150,8 @@ func detectExactDup(imgs []index.Image, out *[]Suggestion, cluster int64) int64 
 	return cluster
 }
 
-func detectNearDup(imgs []index.Image, opts Options, out *[]Suggestion, cluster int64) int64 {
-	for _, group := range clusterByHash(imgs, opts.NearDist) {
+func detectNearDup(imgs []index.Image, idx *hashIndex, opts Options, out *[]Suggestion, cluster int64) int64 {
+	for _, group := range idx.clusters(opts.NearDist) {
 		cluster++
 		keeper := bestInGroup(imgs, group)
 		for _, idx := range group {
@@ -174,8 +175,8 @@ func detectNearDup(imgs []index.Image, opts Options, out *[]Suggestion, cluster 
 
 // detectOvershoot flags the surplus when many photos share a subject. It keeps
 // the best SubjectKeep and suggests deleting the rest.
-func detectOvershoot(imgs []index.Image, opts Options, out *[]Suggestion, cluster int64) int64 {
-	for _, group := range clusterByHash(imgs, opts.SubjectDist) {
+func detectOvershoot(imgs []index.Image, idx *hashIndex, opts Options, out *[]Suggestion, cluster int64) int64 {
+	for _, group := range idx.clusters(opts.SubjectDist) {
 		if len(group) < opts.SubjectMin {
 			continue
 		}

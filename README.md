@@ -75,6 +75,14 @@ cd automation && npm install && node delete.mjs --manifest ../photosift-delete.j
 Useful flags: `analyze --near-dist`, `--subject-min`, `--blur-threshold`;
 `serve --addr`; all commands take `--db`.
 
+## A note on HEIC
+
+iPhone's default `.heic`/`.heif` format has no pure-Go decoder, so photosift
+skips those files (they show up in the `scanned ... could not be decoded` count
+at the end of a scan). Convert them to JPEG first if you want them analysed,
+e.g. with `sips -s format jpeg *.heic --out converted/` on macOS or
+`heif-convert` from `libheif`.
+
 ## Performance
 
 - One decode per file; dHash, blur, brightness and colourfulness are computed

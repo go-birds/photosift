@@ -99,13 +99,15 @@ func (s *Server) handleSummary(w http.ResponseWriter, r *http.Request) {
 		counts[c] = n
 	}
 
-	var total, candidates int
+	var total, candidates, decided int
 	_ = s.db.QueryRow(`SELECT COUNT(*) FROM images`).Scan(&total)
 	_ = s.db.QueryRow(`SELECT COUNT(DISTINCT image_id) FROM suggestions WHERE is_keeper=0`).Scan(&candidates)
+	_ = s.db.QueryRow(`SELECT COUNT(*) FROM decisions`).Scan(&decided)
 
 	writeJSON(w, map[string]any{
 		"total":      total,
 		"candidates": candidates,
+		"decided":    decided,
 		"counts":     counts,
 	})
 }

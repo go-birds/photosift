@@ -154,8 +154,9 @@ async function loadSummary() {
   const s = await getJSON("/api/summary");
   counts = s.counts || {};
   renderTabs();
+  const decidedText = s.decided ? ` · ${s.decided} decided so far` : "";
   document.getElementById("count").textContent =
-    `${s.candidates} of ${s.total} photos suggested for deletion`;
+    `${s.candidates} of ${s.total} photos suggested for deletion${decidedText}`;
 }
 
 function showLightbox(id) {
@@ -164,10 +165,14 @@ function showLightbox(id) {
   lb.classList.remove("hidden");
 }
 
-document.getElementById("lightbox").onclick = () => {
+function closeLightbox() {
   document.getElementById("lightbox").classList.add("hidden");
   document.getElementById("lightbox-img").src = "";
-};
+}
+document.getElementById("lightbox").onclick = closeLightbox;
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") closeLightbox();
+});
 
 document.getElementById("select-all").onclick = async () => {
   const groups = await getJSON(`/api/groups?category=${encodeURIComponent(current)}`);

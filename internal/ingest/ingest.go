@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/go-birds/photosift/internal/takeout"
+	_ "golang.org/x/image/webp"
 )
 
 // schemaSQL creates a fresh database. Existing databases are upgraded by
@@ -127,12 +128,15 @@ func ensureColumns(db *sql.DB) error {
 	return nil
 }
 
+// exts is the set of file extensions we'll attempt to decode. HEIC/HEIF (the
+// default iPhone format that often ends up in Takeout exports) is missing
+// because Go has no pure-Go decoder for it — convert those to JPEG first.
 var exts = map[string]bool{
 	".jpg":  true,
 	".jpeg": true,
 	".png":  true,
 	".gif":  true,
-	".webp": true, // decoded only if the build includes a webp decoder
+	".webp": true,
 }
 
 // record is a fully computed row handed from a worker to the DB writer.
@@ -155,6 +159,7 @@ type existing struct {
 type ScanResult struct {
 	Scanned int // files processed (decoded + written)
 	Skipped int // unchanged files skipped
+	Failed  int // files we couldn't decode (e.g. HEIC, truncated jpegs)
 	Total   int // rows in the table afterward
 }
 
@@ -170,7 +175,7 @@ func ScanPaths(db *sql.DB, roots []string) (ScanResult, error) {
 	pathsCh := make(chan string, 1024)
 	recCh := make(chan record, 1024)
 
-	var scanned, skipped int64
+	var scanned, skipped, failed int64
 	workerCount := runtime.NumCPU()
 	if workerCount < 1 {
 		workerCount = 1
@@ -184,7 +189,7 @@ func ScanPaths(db *sql.DB, roots []string) (ScanResult, error) {
 			for p := range pathsCh {
 				rec, ok, err := processOne(p, prior)
 				if err != nil {
-					fmt.Fprintln(os.Stderr, "scan warning:", p, err)
+					atomic.AddInt64(&failed, 1)
 					continue
 				}
 				if !ok {
@@ -228,6 +233,7 @@ func ScanPaths(db *sql.DB, roots []string) (ScanResult, error) {
 	return ScanResult{
 		Scanned: int(atomic.LoadInt64(&scanned)),
 		Skipped: int(atomic.LoadInt64(&skipped)),
+		Failed:  int(atomic.LoadInt64(&failed)),
 		Total:   total,
 	}, nil
 }
