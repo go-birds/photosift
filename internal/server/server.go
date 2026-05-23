@@ -283,11 +283,23 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// First try the thumbs table populated at scan time.
+	var blob []byte
+	if err := s.db.QueryRow(`SELECT jpeg FROM thumbs WHERE image_id = ?`, id).Scan(&blob); err == nil {
+		s.thumbs.Store(id, blob)
+		w.Header().Set("Content-Type", "image/jpeg")
+		w.Write(blob)
+		return
+	}
+
+	// Fallback: generate on demand (databases scanned before thumbs existed,
+	// or scan-time thumbnail generation failed). Persist for next time.
 	buf, err := s.makeThumb(path)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
+	_, _ = s.db.Exec(`INSERT OR REPLACE INTO thumbs(image_id, jpeg) VALUES (?, ?)`, id, buf)
 	s.thumbs.Store(id, buf)
 	w.Header().Set("Content-Type", "image/jpeg")
 	w.Write(buf)

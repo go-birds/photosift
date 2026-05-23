@@ -64,6 +64,11 @@ CREATE TABLE IF NOT EXISTS decisions (
   action TEXT NOT NULL,
   decided_at_unix INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS thumbs (
+  image_id INTEGER PRIMARY KEY,
+  jpeg BLOB NOT NULL
+);
 `
 
 // upgradeColumns are added to pre-existing image tables that predate the
@@ -146,7 +151,12 @@ type record struct {
 	metrics                   Metrics
 	sizeBytes, mtime, takenAt int64
 	gphotosURL                string
+	thumb                     []byte // JPEG bytes for the review UI
 }
+
+// thumbSize is the long-edge pixel size of the cached thumbnail. Matches
+// internal/server's default so the UI gets the exact image it asks for.
+const thumbSize = 320
 
 // existing lets workers skip files whose size+mtime are unchanged since the
 // last scan, avoiding the expensive decode entirely.
@@ -294,6 +304,11 @@ func processOne(path string, prior map[string]existing) (record, bool, error) {
 		mtime:     fi.ModTime().Unix(),
 		takenAt:   fi.ModTime().Unix(),
 	}
+	// Best-effort thumbnail; failure here is non-fatal (the server can
+	// generate one on demand later).
+	if thumb, err := thumbnailJPEG(img, thumbSize); err == nil {
+		rec.thumb = thumb
+	}
 	if meta, ok := takeout.SidecarFor(path); ok {
 		if meta.TakenAtUnix > 0 {
 			rec.takenAt = meta.TakenAtUnix
@@ -321,6 +336,12 @@ func writeRecords(db *sql.DB, recCh <-chan record) error {
 	now := time.Now().Unix()
 	batch := make([]record, 0, batchSize)
 
+	// Resolves the image_id from the path the row was just upserted with.
+	// Used to attach a thumbnail in the same transaction without needing
+	// lastInsertId (which isn't reliable across ON CONFLICT DO UPDATE).
+	const thumbStmt = `INSERT OR REPLACE INTO thumbs (image_id, jpeg)
+	  VALUES ((SELECT id FROM images WHERE path = ?), ?)`
+
 	flush := func() error {
 		if len(batch) == 0 {
 			return nil
@@ -334,17 +355,33 @@ func writeRecords(db *sql.DB, recCh <-chan record) error {
 			tx.Rollback()
 			return err
 		}
+		psThumb, err := tx.Prepare(thumbStmt)
+		if err != nil {
+			ps.Close()
+			tx.Rollback()
+			return err
+		}
 		for _, r := range batch {
 			if _, err := ps.Exec(r.path, r.sha256, int64(r.metrics.Dhash),
 				r.sizeBytes, r.mtime, now, r.metrics.Width, r.metrics.Height,
 				r.metrics.BlurVar, r.metrics.Brightness, r.metrics.Colorfulness,
 				r.takenAt, r.gphotosURL); err != nil {
 				ps.Close()
+				psThumb.Close()
 				tx.Rollback()
 				return err
 			}
+			if r.thumb != nil {
+				if _, err := psThumb.Exec(r.path, r.thumb); err != nil {
+					ps.Close()
+					psThumb.Close()
+					tx.Rollback()
+					return err
+				}
+			}
 		}
 		ps.Close()
+		psThumb.Close()
 		if err := tx.Commit(); err != nil {
 			return err
 		}
