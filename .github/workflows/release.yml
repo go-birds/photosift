@@ -1,0 +1,70 @@
+name: Release
+
+# Runs when you push a tag like v0.1.0, OR when you manually trigger it from
+# the GitHub Actions tab (useful for grabbing a Mac build without a real
+# release).
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  cli:
+    name: Cross-compile CLI binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      - name: Build for darwin and linux
+        run: |
+          mkdir -p dist
+          # Pure-Go, no CGO, so cross-compile from one runner.
+          GOOS=darwin GOARCH=arm64 go build -o dist/photosift-darwin-arm64 ./cmd/photosift
+          GOOS=darwin GOARCH=amd64 go build -o dist/photosift-darwin-amd64 ./cmd/photosift
+          GOOS=linux  GOARCH=amd64 go build -o dist/photosift-linux-amd64  ./cmd/photosift
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cli-binaries
+          path: dist/
+
+  macapp:
+    name: Build PhotoSift.app
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      - name: Install Wails CLI
+        run: |
+          go install github.com/wailsapp/wails/v2/cmd/wails@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: Build universal .app
+        working-directory: wails
+        run: wails build -platform darwin/universal -clean
+      - name: Zip the bundle
+        working-directory: wails/build/bin
+        run: zip -r PhotoSift-macOS.zip PhotoSift.app
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mac-app
+          path: wails/build/bin/PhotoSift-macOS.zip
+
+  release:
+    name: Attach artifacts to GitHub Release
+    needs: [cli, macapp]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/cli-binaries/*
+            artifacts/mac-app/*
