@@ -44,9 +44,58 @@ jobs:
       - name: Build universal .app
         working-directory: wails
         run: wails build -platform darwin/universal -clean
+
+      # Signing + notarization run only if the Apple secrets exist. Producing
+      # an unsigned .app is still useful (developers can ad-hoc sign locally),
+      # so a missing cert is a warning, not a failure. To enable signing, see
+      # wails/README.md for the secrets you need to set.
+      - name: Sign and notarize
+        working-directory: wails/build/bin
+        env:
+          APPLE_CERT_P12: ${{ secrets.APPLE_CERT_P12 }}
+          APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+          APPLE_DEV_ID: ${{ secrets.APPLE_DEV_ID }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "${APPLE_CERT_P12:-}" ]; then
+            echo "::warning::APPLE_CERT_P12 not set — producing an unsigned .app"
+            echo "First-launch users will need to right-click → Open to bypass Gatekeeper."
+            exit 0
+          fi
+
+          # Import the Developer ID cert into a fresh keychain.
+          echo "$APPLE_CERT_P12" | base64 --decode > /tmp/cert.p12
+          security create-keychain -p "" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "" build.keychain
+          security import /tmp/cert.p12 -k build.keychain \
+            -P "$APPLE_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "" build.keychain
+          rm /tmp/cert.p12
+
+          # Sign with the hardened runtime (required for notarization).
+          codesign --force --deep --options runtime \
+            --sign "$APPLE_DEV_ID" PhotoSift.app
+          codesign --verify --deep --strict PhotoSift.app
+
+          # Submit to Apple's notary service and wait for the verdict.
+          ditto -c -k --keepParent PhotoSift.app PhotoSift-notarize.zip
+          xcrun notarytool submit PhotoSift-notarize.zip \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_APP_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+          # Staple the ticket so Gatekeeper checks pass even offline.
+          xcrun stapler staple PhotoSift.app
+          rm PhotoSift-notarize.zip
+
       - name: Zip the bundle
         working-directory: wails/build/bin
-        run: zip -r PhotoSift-macOS.zip PhotoSift.app
+        run: ditto -c -k --keepParent PhotoSift.app PhotoSift-macOS.zip
       - uses: actions/upload-artifact@v4
         with:
           name: mac-app
