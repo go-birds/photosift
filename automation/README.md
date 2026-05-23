@@ -37,6 +37,21 @@ node delete.mjs --manifest ../photosift-delete.json --apply --limit 20 --delay 1
 | `--limit`         | all                  | Max photos to process this run.      |
 | `--delay`         | `1200`               | Milliseconds between actions.        |
 
-`dhash.mjs` mirrors photosift's perceptual hash and is provided for an
-experimental timeline-matching approach (recognising flagged photos by their
-thumbnail when no direct URL exists). It is not wired into the destructive path.
+## Timeline matching (experimental)
+
+Most Takeout sidecars now omit `url`, so the deleter falls back to perceptual
+hashing if you pass `--match-timeline`. It opens Google Photos' search for the
+photo's calendar day, computes a dHash of each visible thumbnail in the browser,
+and only acts when one tile is unambiguously closer to the manifest hash than
+any other. It will skip any photo where the best and second-best matches are
+too close (so a near-duplicate cannot trigger the wrong delete).
+
+This is **untested against live Google Photos** — the search DOM is undocumented
+and changes often. Even with `--apply` the matcher errs on the side of doing
+nothing: any ambiguity → unmatched. Start with `--limit 5 --match-timeline`
+without `--apply` and read the log.
+
+```bash
+node delete.mjs --manifest ../photosift-delete.json --match-timeline           # dry run
+node delete.mjs --manifest ../photosift-delete.json --match-timeline --apply --limit 5
+```

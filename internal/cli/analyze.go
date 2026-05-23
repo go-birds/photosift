@@ -23,7 +23,14 @@ func init() {
 	analyzeCmd.Flags().IntVar(&anNearDist, "near-dist", 6, "max Hamming distance for near-duplicates")
 	analyzeCmd.Flags().IntVar(&anSubjectMin, "subject-min", 5, "group size that counts as too many photos of one subject")
 	analyzeCmd.Flags().Float64Var(&anBlur, "blur-threshold", 120, "sharpness below this is flagged blurry")
+	analyzeCmd.Flags().BoolVar(&anNoLearn, "no-learn", false, "do not adjust thresholds from past user decisions")
+	analyzeCmd.Flags().StringVar(&anOverrides, "overrides", "", "JSON file of per-album threshold overrides")
 }
+
+var (
+	anNoLearn   bool
+	anOverrides string
+)
 
 var analyzeCmd = &cobra.Command{
 	Use:   "analyze",
@@ -37,15 +44,25 @@ var analyzeCmd = &cobra.Command{
 		}
 		defer db.Close()
 
+		resolver, err := analyze.LoadOverrides(anOverrides)
+		if err != nil {
+			return fmt.Errorf("load overrides: %w", err)
+		}
+
 		sum, err := analyze.Run(db, analyze.Options{
 			NearDist:      anNearDist,
 			SubjectMin:    anSubjectMin,
 			BlurThreshold: anBlur,
+			NoLearn:       anNoLearn,
+			Overrides:     resolver,
 		})
 		if err != nil {
 			return err
 		}
 
+		for _, line := range sum.FeedbackLog {
+			fmt.Printf("learned: %s\n", line)
+		}
 		fmt.Printf("analyzed %d images in %s\n", sum.Total, time.Since(start))
 		cats := make([]string, 0, len(sum.Counts))
 		for c := range sum.Counts {

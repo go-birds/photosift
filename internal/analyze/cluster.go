@@ -41,19 +41,31 @@ func (u *unionFind) union(a, b int) {
 	}
 }
 
-// clusterByHash groups images whose perceptual hashes are within maxDist of one
-// another (transitively) using a BK-tree to find neighbours and union-find to
-// merge them. It returns groups of indices into imgs; singletons are omitted.
-func clusterByHash(imgs []index.Image, maxDist int) [][]int {
-	n := len(imgs)
-	uf := newUnionFind(n)
+// hashIndex is a perceptual-hash BK-tree paired with the images it indexes.
+// Building it is the expensive part; near-duplicate and "same subject" both
+// need clustering at different radii, so we build once and query twice.
+type hashIndex struct {
+	tree sim.BKTree
+	imgs []index.Image
+}
 
-	var tree sim.BKTree
-	for i, img := range imgs {
-		for _, m := range tree.Within(img.Dhash, maxDist) {
+func newHashIndex(imgs []index.Image) *hashIndex {
+	h := &hashIndex{imgs: imgs}
+	for i, im := range imgs {
+		h.tree.Add(im.Dhash, int64(i))
+	}
+	return h
+}
+
+// clusters returns groups of image indices whose perceptual hashes are within
+// maxDist of one another (transitively). Singletons are omitted.
+func (h *hashIndex) clusters(maxDist int) [][]int {
+	n := len(h.imgs)
+	uf := newUnionFind(n)
+	for i := 0; i < n; i++ {
+		for _, m := range h.tree.Within(h.imgs[i].Dhash, maxDist) {
 			uf.union(i, int(m.Value))
 		}
-		tree.Add(img.Dhash, int64(i))
 	}
 
 	groups := map[int][]int{}

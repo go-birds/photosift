@@ -47,3 +47,31 @@ open PhotoSift.app
 ## Configuration
 
 Set `PHOTOSIFT_DB` to point either app at a different database file.
+
+## Releasing a signed, notarized .app
+
+The release workflow (`.github/workflows/release.yml`) signs and notarizes the
+universal `.app` automatically when these GitHub Action secrets exist on the
+repo. Without them you still get a working unsigned build that users have to
+right-click → Open the first time.
+
+| secret               | what it is                                                                 |
+|----------------------|-----------------------------------------------------------------------------|
+| `APPLE_CERT_P12`     | Your "Developer ID Application" cert exported as `.p12`, then base64-encoded. |
+| `APPLE_CERT_PASSWORD`| The password you set when exporting the `.p12`.                            |
+| `APPLE_DEV_ID`       | The cert's common name, e.g. `Developer ID Application: Jane Doe (TEAMID)`. |
+| `APPLE_ID`           | Your Apple Developer account email.                                        |
+| `APPLE_APP_PASSWORD` | An [app-specific password](https://appleid.apple.com) for `notarytool`.    |
+| `APPLE_TEAM_ID`      | Your 10-character team ID.                                                 |
+
+One-time setup on your Mac to produce the `.p12`:
+
+```bash
+# In Keychain Access, find your "Developer ID Application" cert, right-click,
+# Export -> Personal Information Exchange (.p12), choose a password.
+# Then encode it for the secret:
+base64 -i DeveloperID.p12 | pbcopy
+# Paste into the APPLE_CERT_P12 secret on GitHub.
+```
+
+You need a paid Apple Developer membership ($99/yr) for the cert.

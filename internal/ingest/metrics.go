@@ -1,7 +1,9 @@
 package ingest
 
 import (
+	"bytes"
 	"image"
+	"image/jpeg"
 	"math"
 
 	"golang.org/x/image/draw"
@@ -117,6 +119,35 @@ func laplacianVariance(gray []float64, w, h int) float64 {
 	}
 	mean := sum / float64(n)
 	return sumSq/float64(n) - mean*mean
+}
+
+// thumbnailJPEG scales img to fit within maxSide and JPEG-encodes the result.
+// Generating thumbs at scan time and storing them in the DB means the review
+// UI doesn't have to re-decode and re-scale every original on first view.
+func thumbnailJPEG(img image.Image, maxSide int) ([]byte, error) {
+	b := img.Bounds()
+	w, h := b.Dx(), b.Dy()
+	nw, nh := w, h
+	if w >= h {
+		if w > maxSide {
+			nw, nh = maxSide, h*maxSide/w
+		}
+	} else if h > maxSide {
+		nh, nw = maxSide, w*maxSide/h
+	}
+	if nw < 1 {
+		nw = 1
+	}
+	if nh < 1 {
+		nh = 1
+	}
+	dst := image.NewRGBA(image.Rect(0, 0, nw, nh))
+	draw.ApproxBiLinear.Scale(dst, dst.Bounds(), img, b, draw.Src, nil)
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, dst, &jpeg.Options{Quality: 80}); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }
 
 // dHash produces a 64-bit perceptual hash (row-wise gradient signature).

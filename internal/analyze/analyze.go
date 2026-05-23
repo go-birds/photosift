@@ -30,6 +30,8 @@ type Options struct {
 	DarkThreshold   float64 // mean brightness below this is "too dark"
 	BrightThreshold float64 // mean brightness above this is "blown out"
 	Classifier      Classifier
+	NoLearn         bool       // disable threshold adjustment from user decisions
+	Overrides       *Resolver  // per-album threshold overrides (nil = none)
 }
 
 func (o *Options) applyDefaults() {
@@ -57,6 +59,9 @@ func (o *Options) applyDefaults() {
 	if o.Classifier == nil {
 		o.Classifier = DefaultHeuristic()
 	}
+	if o.Overrides == nil {
+		o.Overrides = &Resolver{}
+	}
 }
 
 // Suggestion is one (image, category) finding.
@@ -72,13 +77,22 @@ type Suggestion struct {
 // Summary is a per-category count of deletion candidates (keepers excluded).
 type Summary struct {
 	Counts          map[string]int
-	CandidateImages int // distinct images suggested for deletion
-	Total           int // images analysed
+	CandidateImages int      // distinct images suggested for deletion
+	Total           int      // images analysed
+	FeedbackLog     []string // adjustments learned from user decisions, if any
 }
 
 // Run analyses every indexed image and rewrites the suggestions table.
 func Run(db *sql.DB, opts Options) (Summary, error) {
 	opts.applyDefaults()
+
+	var feedbackLog []string
+	if !opts.NoLearn {
+		log, err := applyFeedback(db, &opts)
+		if err == nil {
+			feedbackLog = log
+		}
+	}
 
 	imgs, err := index.LoadAllImages(db)
 	if err != nil {
@@ -88,9 +102,10 @@ func Run(db *sql.DB, opts Options) (Summary, error) {
 	var sugs []Suggestion
 	var cluster int64
 
+	hashIdx := newHashIndex(imgs)
 	cluster = detectExactDup(imgs, &sugs, cluster)
-	cluster = detectNearDup(imgs, opts, &sugs, cluster)
-	cluster = detectOvershoot(imgs, opts, &sugs, cluster)
+	cluster = detectNearDup(imgs, hashIdx, opts, &sugs, cluster)
+	cluster = detectOvershoot(imgs, hashIdx, opts, &sugs, cluster)
 	detectLowQuality(imgs, opts, &sugs)
 	detectUseless(imgs, opts, &sugs)
 
@@ -108,6 +123,7 @@ func Run(db *sql.DB, opts Options) (Summary, error) {
 		candidates[s.ImageID] = true
 	}
 	sum.CandidateImages = len(candidates)
+	sum.FeedbackLog = feedbackLog
 	return sum, nil
 }
 
@@ -149,8 +165,8 @@ func detectExactDup(imgs []index.Image, out *[]Suggestion, cluster int64) int64 
 	return cluster
 }
 
-func detectNearDup(imgs []index.Image, opts Options, out *[]Suggestion, cluster int64) int64 {
-	for _, group := range clusterByHash(imgs, opts.NearDist) {
+func detectNearDup(imgs []index.Image, idx *hashIndex, opts Options, out *[]Suggestion, cluster int64) int64 {
+	for _, group := range idx.clusters(opts.NearDist) {
 		cluster++
 		keeper := bestInGroup(imgs, group)
 		for _, idx := range group {
@@ -174,8 +190,8 @@ func detectNearDup(imgs []index.Image, opts Options, out *[]Suggestion, cluster 
 
 // detectOvershoot flags the surplus when many photos share a subject. It keeps
 // the best SubjectKeep and suggests deleting the rest.
-func detectOvershoot(imgs []index.Image, opts Options, out *[]Suggestion, cluster int64) int64 {
-	for _, group := range clusterByHash(imgs, opts.SubjectDist) {
+func detectOvershoot(imgs []index.Image, idx *hashIndex, opts Options, out *[]Suggestion, cluster int64) int64 {
+	for _, group := range idx.clusters(opts.SubjectDist) {
 		if len(group) < opts.SubjectMin {
 			continue
 		}
@@ -211,19 +227,23 @@ func detectOvershoot(imgs []index.Image, opts Options, out *[]Suggestion, cluste
 
 func detectLowQuality(imgs []index.Image, opts Options, out *[]Suggestion) {
 	for _, img := range imgs {
+		ov := opts.Overrides.For(img.Path)
+		blur := effectiveBlur(ov, opts.BlurThreshold)
+		dark := effectiveDark(ov, opts.DarkThreshold)
+		bright := effectiveBright(ov, opts.BrightThreshold)
 		switch {
-		case img.BlurVar > 0 && img.BlurVar < opts.BlurThreshold:
-			score := clamp01((opts.BlurThreshold - img.BlurVar) / opts.BlurThreshold)
+		case img.BlurVar > 0 && img.BlurVar < blur:
+			score := clamp01((blur - img.BlurVar) / blur)
 			*out = append(*out, Suggestion{
 				ImageID: img.ID, Category: CatLowQuality, Score: score,
 				Reason: fmt.Sprintf("blurry / soft focus (sharpness %.0f)", img.BlurVar),
 			})
-		case img.Brightness > 0 && img.Brightness < opts.DarkThreshold:
+		case img.Brightness > 0 && img.Brightness < dark:
 			*out = append(*out, Suggestion{
 				ImageID: img.ID, Category: CatLowQuality, Score: 0.7,
 				Reason: fmt.Sprintf("very dark (brightness %.0f)", img.Brightness),
 			})
-		case img.Brightness > opts.BrightThreshold:
+		case img.Brightness > bright:
 			*out = append(*out, Suggestion{
 				ImageID: img.ID, Category: CatLowQuality, Score: 0.7,
 				Reason: fmt.Sprintf("over-exposed (brightness %.0f)", img.Brightness),
@@ -233,8 +253,18 @@ func detectLowQuality(imgs []index.Image, opts Options, out *[]Suggestion) {
 }
 
 func detectUseless(imgs []index.Image, opts Options, out *[]Suggestion) {
+	// Resolve the global default threshold once — overrides may still bump it
+	// per image.
+	defaultThreshold := 0.45
+	if hc, ok := opts.Classifier.(HeuristicClassifier); ok {
+		defaultThreshold = hc.Threshold
+	}
 	for _, img := range imgs {
 		label, score, useless := opts.Classifier.Classify(img)
+		if ov := opts.Overrides.For(img.Path); ov.UselessThreshold != nil {
+			// Re-evaluate with the per-album threshold.
+			useless = uselessBuckets[label] && score >= effectiveUseless(ov, defaultThreshold)
+		}
 		if useless {
 			*out = append(*out, Suggestion{
 				ImageID: img.ID, Category: CatUseless, Score: score,

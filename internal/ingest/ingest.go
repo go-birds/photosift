@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/go-birds/photosift/internal/takeout"
+	_ "golang.org/x/image/webp"
 )
 
 // schemaSQL creates a fresh database. Existing databases are upgraded by
@@ -62,6 +63,11 @@ CREATE TABLE IF NOT EXISTS decisions (
   image_id INTEGER PRIMARY KEY,
   action TEXT NOT NULL,
   decided_at_unix INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS thumbs (
+  image_id INTEGER PRIMARY KEY,
+  jpeg BLOB NOT NULL
 );
 `
 
@@ -127,13 +133,21 @@ func ensureColumns(db *sql.DB) error {
 	return nil
 }
 
+// exts is the set of file extensions we'll attempt to decode. HEIC/HEIF (the
+// default iPhone format that often ends up in Takeout exports) is decoded via
+// a shell-out to libheif or sips — see heic.go.
 var exts = map[string]bool{
 	".jpg":  true,
 	".jpeg": true,
 	".png":  true,
 	".gif":  true,
-	".webp": true, // decoded only if the build includes a webp decoder
+	".webp": true,
+	".heic": true,
+	".heif": true,
 }
+
+// heicExts identifies files that need the external converter.
+var heicExts = map[string]bool{".heic": true, ".heif": true}
 
 // record is a fully computed row handed from a worker to the DB writer.
 type record struct {
@@ -142,7 +156,12 @@ type record struct {
 	metrics                   Metrics
 	sizeBytes, mtime, takenAt int64
 	gphotosURL                string
+	thumb                     []byte // JPEG bytes for the review UI
 }
+
+// thumbSize is the long-edge pixel size of the cached thumbnail. Matches
+// internal/server's default so the UI gets the exact image it asks for.
+const thumbSize = 320
 
 // existing lets workers skip files whose size+mtime are unchanged since the
 // last scan, avoiding the expensive decode entirely.
@@ -155,6 +174,7 @@ type existing struct {
 type ScanResult struct {
 	Scanned int // files processed (decoded + written)
 	Skipped int // unchanged files skipped
+	Failed  int // files we couldn't decode (e.g. HEIC, truncated jpegs)
 	Total   int // rows in the table afterward
 }
 
@@ -170,7 +190,7 @@ func ScanPaths(db *sql.DB, roots []string) (ScanResult, error) {
 	pathsCh := make(chan string, 1024)
 	recCh := make(chan record, 1024)
 
-	var scanned, skipped int64
+	var scanned, skipped, failed int64
 	workerCount := runtime.NumCPU()
 	if workerCount < 1 {
 		workerCount = 1
@@ -184,7 +204,7 @@ func ScanPaths(db *sql.DB, roots []string) (ScanResult, error) {
 			for p := range pathsCh {
 				rec, ok, err := processOne(p, prior)
 				if err != nil {
-					fmt.Fprintln(os.Stderr, "scan warning:", p, err)
+					atomic.AddInt64(&failed, 1)
 					continue
 				}
 				if !ok {
@@ -228,6 +248,7 @@ func ScanPaths(db *sql.DB, roots []string) (ScanResult, error) {
 	return ScanResult{
 		Scanned: int(atomic.LoadInt64(&scanned)),
 		Skipped: int(atomic.LoadInt64(&skipped)),
+		Failed:  int(atomic.LoadInt64(&failed)),
 		Total:   total,
 	}, nil
 }
@@ -275,7 +296,12 @@ func processOne(path string, prior map[string]existing) (record, bool, error) {
 		return record{}, false, err
 	}
 
-	img, _, err := image.Decode(f)
+	var img image.Image
+	if heicExts[strings.ToLower(filepath.Ext(path))] {
+		img, err = decodeHEIC(path)
+	} else {
+		img, _, err = image.Decode(f)
+	}
 	if err != nil {
 		return record{}, false, err
 	}
@@ -287,6 +313,11 @@ func processOne(path string, prior map[string]existing) (record, bool, error) {
 		sizeBytes: fi.Size(),
 		mtime:     fi.ModTime().Unix(),
 		takenAt:   fi.ModTime().Unix(),
+	}
+	// Best-effort thumbnail; failure here is non-fatal (the server can
+	// generate one on demand later).
+	if thumb, err := thumbnailJPEG(img, thumbSize); err == nil {
+		rec.thumb = thumb
 	}
 	if meta, ok := takeout.SidecarFor(path); ok {
 		if meta.TakenAtUnix > 0 {
@@ -315,6 +346,12 @@ func writeRecords(db *sql.DB, recCh <-chan record) error {
 	now := time.Now().Unix()
 	batch := make([]record, 0, batchSize)
 
+	// Resolves the image_id from the path the row was just upserted with.
+	// Used to attach a thumbnail in the same transaction without needing
+	// lastInsertId (which isn't reliable across ON CONFLICT DO UPDATE).
+	const thumbStmt = `INSERT OR REPLACE INTO thumbs (image_id, jpeg)
+	  VALUES ((SELECT id FROM images WHERE path = ?), ?)`
+
 	flush := func() error {
 		if len(batch) == 0 {
 			return nil
@@ -328,17 +365,33 @@ func writeRecords(db *sql.DB, recCh <-chan record) error {
 			tx.Rollback()
 			return err
 		}
+		psThumb, err := tx.Prepare(thumbStmt)
+		if err != nil {
+			ps.Close()
+			tx.Rollback()
+			return err
+		}
 		for _, r := range batch {
 			if _, err := ps.Exec(r.path, r.sha256, int64(r.metrics.Dhash),
 				r.sizeBytes, r.mtime, now, r.metrics.Width, r.metrics.Height,
 				r.metrics.BlurVar, r.metrics.Brightness, r.metrics.Colorfulness,
 				r.takenAt, r.gphotosURL); err != nil {
 				ps.Close()
+				psThumb.Close()
 				tx.Rollback()
 				return err
 			}
+			if r.thumb != nil {
+				if _, err := psThumb.Exec(r.path, r.thumb); err != nil {
+					ps.Close()
+					psThumb.Close()
+					tx.Rollback()
+					return err
+				}
+			}
 		}
 		ps.Close()
+		psThumb.Close()
 		if err := tx.Commit(); err != nil {
 			return err
 		}

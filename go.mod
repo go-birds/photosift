@@ -5,7 +5,9 @@ module github.com/go-birds/photosift
 go 1.25.0
 
 require (
+	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/spf13/cobra v1.7.0
+	github.com/yalue/onnxruntime_go v1.30.1
 	golang.org/x/image v0.41.0
 	modernc.org/sqlite v1.44.3
 )

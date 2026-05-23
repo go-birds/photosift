@@ -21,22 +21,67 @@ import (
 	"time"
 
 	"github.com/go-birds/photosift/internal/analyze"
+	lru "github.com/hashicorp/golang-lru/v2"
 	"golang.org/x/image/draw"
 )
 
 //go:embed web
 var webFS embed.FS
 
+// thumbCacheSize bounds the in-memory thumbnail cache. 512 * ~6KB jpeg ≈ 3 MB
+// resident — enough to keep an entire review session hot without blowing up
+// on a 100k-photo library.
+const thumbCacheSize = 512
+
 // Server holds the dependencies for the review UI.
 type Server struct {
 	db        *sql.DB
-	thumbs    sync.Map // id -> []byte (jpeg)
+	thumbs    *lru.Cache[int64, []byte] // bounded; persistent copy lives in DB
 	thumbSide int
+
+	// SSE subscribers fanning out summary updates whenever a decision
+	// changes. Local app, single user — a tiny hub is plenty.
+	subsMu sync.Mutex
+	subs   map[chan struct{}]struct{}
 }
 
 // New builds a server backed by the given database handle.
 func New(db *sql.DB) *Server {
-	return &Server{db: db, thumbSide: 320}
+	cache, _ := lru.New[int64, []byte](thumbCacheSize)
+	return &Server{
+		db:        db,
+		thumbs:    cache,
+		thumbSide: 320,
+		subs:      map[chan struct{}]struct{}{},
+	}
+}
+
+func (s *Server) subscribe() chan struct{} {
+	ch := make(chan struct{}, 1)
+	s.subsMu.Lock()
+	s.subs[ch] = struct{}{}
+	s.subsMu.Unlock()
+	return ch
+}
+
+func (s *Server) unsubscribe(ch chan struct{}) {
+	s.subsMu.Lock()
+	delete(s.subs, ch)
+	s.subsMu.Unlock()
+}
+
+// notify wakes every subscriber without blocking. A buffered channel of 1 means
+// the wake-up is coalesced — multiple writes between flushes collapse to one
+// pending notification.
+func (s *Server) notify() {
+	s.subsMu.Lock()
+	defer s.subsMu.Unlock()
+	for ch := range s.subs {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
 }
 
 // Handler returns the HTTP handler for the whole app.
@@ -51,6 +96,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/thumb/", s.handleThumb)
 	mux.HandleFunc("/api/image/", s.handleImage)
 	mux.HandleFunc("/api/decision", s.handleDecision)
+	mux.HandleFunc("/api/events", s.handleEvents)
 	mux.HandleFunc("/api/export.csv", s.handleExportCSV)
 	mux.HandleFunc("/api/export.json", s.handleExportJSON)
 	return mux
@@ -81,11 +127,10 @@ func writeJSON(w http.ResponseWriter, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-func (s *Server) handleSummary(w http.ResponseWriter, r *http.Request) {
+func (s *Server) summary() (map[string]any, error) {
 	rows, err := s.db.Query(`SELECT category, COUNT(*) FROM suggestions WHERE is_keeper=0 GROUP BY category`)
 	if err != nil {
-		http.Error(w, err.Error(), 500)
-		return
+		return nil, err
 	}
 	defer rows.Close()
 	counts := map[string]int{}
@@ -93,21 +138,73 @@ func (s *Server) handleSummary(w http.ResponseWriter, r *http.Request) {
 		var c string
 		var n int
 		if err := rows.Scan(&c, &n); err != nil {
-			http.Error(w, err.Error(), 500)
-			return
+			return nil, err
 		}
 		counts[c] = n
 	}
 
-	var total, candidates int
+	var total, candidates, decided int
 	_ = s.db.QueryRow(`SELECT COUNT(*) FROM images`).Scan(&total)
 	_ = s.db.QueryRow(`SELECT COUNT(DISTINCT image_id) FROM suggestions WHERE is_keeper=0`).Scan(&candidates)
-
-	writeJSON(w, map[string]any{
+	_ = s.db.QueryRow(`SELECT COUNT(*) FROM decisions`).Scan(&decided)
+	return map[string]any{
 		"total":      total,
 		"candidates": candidates,
+		"decided":    decided,
 		"counts":     counts,
-	})
+	}, nil
+}
+
+func (s *Server) handleSummary(w http.ResponseWriter, r *http.Request) {
+	sum, err := s.summary()
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	writeJSON(w, sum)
+}
+
+// handleEvents is a Server-Sent Events stream. Whenever a decision changes,
+// every connected client gets a fresh summary pushed — no polling, no
+// per-click GETs. SSE was chosen over WebSocket because the traffic is
+// strictly one-way and SSE works through proxies without negotiation.
+func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", 500)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no") // disable proxy buffering if any
+
+	ch := s.subscribe()
+	defer s.unsubscribe(ch)
+
+	// Push the current summary immediately so the client doesn't need a
+	// separate /api/summary fetch on connect.
+	send := func() {
+		sum, err := s.summary()
+		if err != nil {
+			return
+		}
+		data, _ := json.Marshal(sum)
+		_, _ = w.Write([]byte("data: "))
+		_, _ = w.Write(data)
+		_, _ = w.Write([]byte("\n\n"))
+		flusher.Flush()
+	}
+	send()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-ch:
+			send()
+		}
+	}
 }
 
 func (s *Server) handleGroups(w http.ResponseWriter, r *http.Request) {
@@ -133,8 +230,9 @@ func (s *Server) handleGroups(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 
 	// Cluster 0 means "no cluster" (e.g. low quality); each such image is its
-	// own single-item group.
-	var groups []groupDTO
+	// own single-item group. Initialised non-nil so an empty result encodes as
+	// JSON [] instead of null.
+	groups := []groupDTO{}
 	byCluster := map[int64]int{} // cluster_id -> index into groups
 	singleSeq := int64(-1)
 
@@ -192,18 +290,30 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not found", 404)
 		return
 	}
-	if cached, ok := s.thumbs.Load(id); ok {
+	if cached, ok := s.thumbs.Get(id); ok {
 		w.Header().Set("Content-Type", "image/jpeg")
-		w.Write(cached.([]byte))
+		w.Write(cached)
 		return
 	}
 
+	// First try the thumbs table populated at scan time.
+	var blob []byte
+	if err := s.db.QueryRow(`SELECT jpeg FROM thumbs WHERE image_id = ?`, id).Scan(&blob); err == nil {
+		s.thumbs.Add(id, blob)
+		w.Header().Set("Content-Type", "image/jpeg")
+		w.Write(blob)
+		return
+	}
+
+	// Fallback: generate on demand (databases scanned before thumbs existed,
+	// or scan-time thumbnail generation failed). Persist for next time.
 	buf, err := s.makeThumb(path)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	s.thumbs.Store(id, buf)
+	_, _ = s.db.Exec(`INSERT OR REPLACE INTO thumbs(image_id, jpeg) VALUES (?, ?)`, id, buf)
+	s.thumbs.Add(id, buf)
 	w.Header().Set("Content-Type", "image/jpeg")
 	w.Write(buf)
 }
@@ -263,6 +373,7 @@ func (s *Server) handleDecision(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), 500)
 			return
 		}
+		s.notify()
 		writeJSON(w, map[string]string{"status": "ok"})
 		return
 	}
@@ -278,6 +389,7 @@ func (s *Server) handleDecision(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 500)
 		return
 	}
+	s.notify()
 	writeJSON(w, map[string]string{"status": "ok"})
 }
 

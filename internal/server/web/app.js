@@ -48,7 +48,7 @@ function basename(p) {
   return i >= 0 ? p.slice(i + 1) : p;
 }
 
-function makeCard(img) {
+function makeCard(img, group) {
   const card = document.createElement("div");
   card.className = "card";
   if (img.decision === "delete") card.classList.add("delete");
@@ -59,7 +59,7 @@ function makeCard(img) {
   const im = document.createElement("img");
   im.loading = "lazy";
   im.src = `/api/thumb/${img.id}`;
-  im.onclick = () => showLightbox(img.id);
+  im.onclick = () => showLightbox(group, group.images.indexOf(img));
   wrap.appendChild(im);
   card.appendChild(wrap);
 
@@ -89,7 +89,6 @@ function makeCard(img) {
     await postDecision(img.id, next);
     img.decision = next === "clear" ? "" : "delete";
     refreshCardState(card, del, keep, img);
-    loadSummary();
   };
 
   const keep = document.createElement("button");
@@ -100,7 +99,6 @@ function makeCard(img) {
     await postDecision(img.id, next);
     img.decision = next === "clear" ? "" : "keep";
     refreshCardState(card, del, keep, img);
-    loadSummary();
   };
 
   actions.appendChild(del);
@@ -144,30 +142,218 @@ async function loadGroups() {
     }
     const grid = document.createElement("div");
     grid.className = "grid";
-    for (const img of g.images) grid.appendChild(makeCard(img));
+    for (const img of g.images) grid.appendChild(makeCard(img, g));
     div.appendChild(grid);
     container.appendChild(div);
   }
 }
 
 async function loadSummary() {
-  const s = await getJSON("/api/summary");
-  counts = s.counts || {};
-  renderTabs();
-  document.getElementById("count").textContent =
-    `${s.candidates} of ${s.total} photos suggested for deletion`;
+  applySummary(await getJSON("/api/summary"));
 }
 
-function showLightbox(id) {
-  const lb = document.getElementById("lightbox");
-  document.getElementById("lightbox-img").src = `/api/image/${id}`;
-  lb.classList.remove("hidden");
+// Lightbox keeps its current group + index so arrow keys can flip through the
+// cluster without closing the overlay.
+const lightbox = { group: null, index: 0 };
+
+function showLightbox(group, index) {
+  lightbox.group = group;
+  lightbox.index = index;
+  renderLightbox();
+  document.getElementById("lightbox").classList.remove("hidden");
 }
 
-document.getElementById("lightbox").onclick = () => {
+function renderLightbox() {
+  if (!lightbox.group) return;
+  const img = lightbox.group.images[lightbox.index];
+  document.getElementById("lightbox-img").src = `/api/image/${img.id}`;
+}
+
+function closeLightbox() {
   document.getElementById("lightbox").classList.add("hidden");
   document.getElementById("lightbox-img").src = "";
+  lightbox.group = null;
+}
+document.getElementById("lightbox").onclick = closeLightbox;
+
+function lightboxIsOpen() {
+  return !document.getElementById("lightbox").classList.contains("hidden");
+}
+
+/* ---------------- Review mode ---------------- */
+//
+// Tinder-style triage: one cluster at a time, keyboard-first. The undo stack
+// records every action so 'U' restores the prior state of that cluster's
+// decisions — important because Space-spammers will overshoot.
+
+const review = {
+  active: false,
+  groups: [],
+  cursor: 0,
+  history: [], // [{ cursor, before: [{image_id, decision}] }]
 };
+
+document.getElementById("review-toggle").onclick = enterReview;
+document.getElementById("review-exit").onclick = exitReview;
+
+async function enterReview() {
+  review.groups = await getJSON(`/api/groups?category=${encodeURIComponent(current)}`);
+  if (review.groups.length === 0) return;
+  review.cursor = 0;
+  review.history = [];
+  review.active = true;
+  document.getElementById("groups").classList.add("hidden");
+  document.getElementById("review-panel").classList.remove("hidden");
+  renderReview();
+}
+
+function exitReview() {
+  review.active = false;
+  document.getElementById("review-panel").classList.add("hidden");
+  document.getElementById("groups").classList.remove("hidden");
+  loadGroups();
+}
+
+function renderReview() {
+  const slot = document.getElementById("review-cluster");
+  slot.innerHTML = "";
+  const g = review.groups[review.cursor];
+  if (!g) {
+    exitReview();
+    return;
+  }
+
+  const wrap = document.createElement("div");
+  wrap.className = "group";
+  if (g.images.length > 1) {
+    const h = document.createElement("h3");
+    h.textContent = `Group of ${g.images.length} — Space to accept default, K to keep all, D to delete the rest`;
+    wrap.appendChild(h);
+  }
+  const grid = document.createElement("div");
+  grid.className = "grid";
+  for (const img of g.images) grid.appendChild(makeCard(img, g));
+  wrap.appendChild(grid);
+  slot.appendChild(wrap);
+
+  document.getElementById("review-pos").textContent =
+    `Cluster ${review.cursor + 1} of ${review.groups.length}`;
+  document.getElementById("review-bar-fill").style.width =
+    `${((review.cursor + 1) / review.groups.length) * 100}%`;
+}
+
+// snapshot the current decisions on the visible cluster so 'U' can revert.
+function snapshot() {
+  const g = review.groups[review.cursor];
+  const before = g.images.map((i) => ({
+    image_id: i.id,
+    decision: i.decision || "",
+  }));
+  review.history.push({ cursor: review.cursor, before });
+}
+
+async function applyDefault(group) {
+  for (const img of group.images) {
+    if (img.is_keeper) continue;
+    if (img.decision !== "delete") {
+      await postDecision(img.id, "delete");
+      img.decision = "delete";
+    }
+  }
+}
+
+async function keepAll(group) {
+  for (const img of group.images) {
+    if (img.decision) {
+      await postDecision(img.id, "clear");
+      img.decision = "";
+    }
+  }
+}
+
+async function undo() {
+  const step = review.history.pop();
+  if (!step) return;
+  review.cursor = step.cursor;
+  const group = review.groups[review.cursor];
+  // Restore each image's decision to what it was before the previous action.
+  for (let i = 0; i < group.images.length; i++) {
+    const target = step.before[i].decision;
+    const current = group.images[i].decision || "";
+    if (target === current) continue;
+    await postDecision(group.images[i].id, target || "clear");
+    group.images[i].decision = target;
+  }
+  renderReview();
+}
+
+function reviewNext() {
+  if (review.cursor < review.groups.length - 1) {
+    review.cursor++;
+    renderReview();
+  } else {
+    exitReview();
+  }
+}
+
+function reviewPrev() {
+  if (review.cursor > 0) {
+    review.cursor--;
+    renderReview();
+  }
+}
+
+document.addEventListener("keydown", async (e) => {
+  if (e.key === "Escape") {
+    closeLightbox();
+    if (review.active) exitReview();
+    return;
+  }
+  // Lightbox open: arrow keys flip within the current cluster instead of
+  // navigating clusters in review mode.
+  if (lightboxIsOpen() && lightbox.group) {
+    if (e.key === "ArrowRight") {
+      e.preventDefault();
+      lightbox.index = (lightbox.index + 1) % lightbox.group.images.length;
+      renderLightbox();
+      return;
+    }
+    if (e.key === "ArrowLeft") {
+      e.preventDefault();
+      lightbox.index =
+        (lightbox.index - 1 + lightbox.group.images.length) % lightbox.group.images.length;
+      renderLightbox();
+      return;
+    }
+  }
+  if (!review.active) return;
+  // ignore keystrokes while typing in inputs (none today but defensive).
+  if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
+
+  const g = review.groups[review.cursor];
+  if (!g) return;
+
+  if (e.key === " " || e.key === "d" || e.key === "D") {
+    e.preventDefault();
+    snapshot();
+    await applyDefault(g);
+    reviewNext();
+  } else if (e.key === "k" || e.key === "K") {
+    e.preventDefault();
+    snapshot();
+    await keepAll(g);
+    reviewNext();
+  } else if (e.key === "ArrowRight") {
+    e.preventDefault();
+    reviewNext();
+  } else if (e.key === "ArrowLeft") {
+    e.preventDefault();
+    reviewPrev();
+  } else if (e.key === "u" || e.key === "U") {
+    e.preventDefault();
+    await undo();
+  }
+});
 
 document.getElementById("select-all").onclick = async () => {
   const groups = await getJSON(`/api/groups?category=${encodeURIComponent(current)}`);
@@ -177,10 +363,35 @@ document.getElementById("select-all").onclick = async () => {
       if (!img.is_keeper) ids.push(img.id);
   await Promise.all(ids.map((id) => postDecision(id, "delete")));
   await loadGroups();
-  await loadSummary();
 };
+
+// applySummary updates the toolbar count and tab badges from a summary object.
+// Used by both the initial fetch and every SSE push.
+function applySummary(s) {
+  counts = s.counts || {};
+  renderTabs();
+  const decidedText = s.decided ? ` · ${s.decided} decided so far` : "";
+  document.getElementById("count").textContent =
+    `${s.candidates} of ${s.total} photos suggested for deletion${decidedText}`;
+}
+
+// connectEvents opens an SSE stream and reapplies the summary on every push.
+// The server sends one immediately on connect, then again after every decision
+// change, so the UI stays current without explicit polling.
+function connectEvents() {
+  const es = new EventSource("/api/events");
+  es.onmessage = (e) => {
+    try {
+      applySummary(JSON.parse(e.data));
+    } catch {
+      // ignore malformed frames; next event will arrive.
+    }
+  };
+  // EventSource auto-reconnects on transient errors; nothing to do here.
+}
 
 (async function init() {
   await loadSummary();
   await loadGroups();
+  connectEvents();
 })();
