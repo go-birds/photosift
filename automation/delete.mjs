@@ -24,6 +24,7 @@
 
 import { chromium } from "playwright";
 import { readFile, writeFile } from "node:fs/promises";
+import { matchEntry } from "./timeline-match.mjs";
 
 function parseArgs(argv) {
   const args = {
@@ -32,10 +33,12 @@ function parseArgs(argv) {
     userDataDir: "./.gphotos-profile",
     limit: Infinity,
     delay: 1200,
+    matchTimeline: false,
   };
   for (let i = 2; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--apply") args.apply = true;
+    else if (a === "--match-timeline") args.matchTimeline = true;
     else if (a === "--manifest") args.manifest = argv[++i];
     else if (a === "--user-data-dir") args.userDataDir = argv[++i];
     else if (a === "--limit") args.limit = parseInt(argv[++i], 10);
@@ -90,17 +93,23 @@ async function main() {
   const withoutUrl = manifest.filter((m) => !m.gphotos_url);
 
   console.log(`manifest: ${manifest.length} photos`);
-  console.log(`  with Google Photos URL: ${withUrl.length}`);
-  console.log(`  without URL (skipped):  ${withoutUrl.length}`);
+  console.log(`  with Google Photos URL:    ${withUrl.length}`);
+  if (args.matchTimeline) {
+    console.log(`  without URL (will match):  ${withoutUrl.length}`);
+  } else {
+    console.log(`  without URL (will skip):   ${withoutUrl.length}`);
+  }
   console.log(args.apply ? "MODE: APPLY (will delete)" : "MODE: DRY RUN (no deletions)");
-
-  if (withoutUrl.length) {
-    await writeFile(
-      "manual-review.json",
-      JSON.stringify(withoutUrl, null, 2),
-    );
+  if (args.matchTimeline) {
     console.log(
-      `  -> wrote manual-review.json; these have no direct link and must be deleted by hand`,
+      "MATCHER: EXPERIMENTAL — date-search + perceptual hashing, untested against live Google Photos",
+    );
+  }
+
+  if (withoutUrl.length && !args.matchTimeline) {
+    await writeFile("manual-review.json", JSON.stringify(withoutUrl, null, 2));
+    console.log(
+      `  -> wrote manual-review.json; pass --match-timeline to attempt matching, or delete these by hand`,
     );
   }
 
@@ -118,7 +127,9 @@ async function main() {
   }
 
   let done = 0;
-  const results = { deleted: 0, dryRun: 0, failed: 0 };
+  const results = { deleted: 0, dryRun: 0, failed: 0, unmatched: 0 };
+
+  // Pass 1: direct URL deletes — fast and unambiguous.
   for (const item of withUrl) {
     if (done >= args.limit) break;
     done++;
@@ -136,7 +147,53 @@ async function main() {
     await sleep(args.delay);
   }
 
-  console.log(`\nDone. deleted=${results.deleted} dryRun=${results.dryRun} failed=${results.failed}`);
+  // Pass 2: perceptual-hash timeline matching for entries without a URL.
+  // Opt-in (--match-timeline) and conservative: skips on any ambiguity.
+  if (args.matchTimeline) {
+    for (const item of withoutUrl) {
+      if (done >= args.limit) break;
+      done++;
+      try {
+        const match = await matchEntry(page, item, {
+          log: (m) => console.log(m),
+        });
+        if (!match) {
+          results.unmatched++;
+          console.log(`[${done}] unmatched: ${item.path}`);
+          continue;
+        }
+        if (!args.apply) {
+          results.dryRun++;
+          console.log(
+            `[${done}] would-delete (timeline match, dist=${match.distance}): ${item.path}`,
+          );
+        } else {
+          // Click the matched tile, then run the same delete flow.
+          await page.mouse.click(
+            match.rect.x + match.rect.w / 2,
+            match.rect.y + match.rect.h / 2,
+          );
+          await sleep(args.delay);
+          const outcome = await clickDelete(page, true);
+          if (outcome === "deleted") {
+            results.deleted++;
+            console.log(`[${done}] deleted (dist=${match.distance}): ${item.path}`);
+          } else {
+            results.failed++;
+            console.log(`[${done}] match found but delete failed: ${item.path}`);
+          }
+        }
+      } catch (err) {
+        results.failed++;
+        console.log(`[${done}] FAILED: ${item.path} (${err.message})`);
+      }
+      await sleep(args.delay);
+    }
+  }
+
+  console.log(
+    `\nDone. deleted=${results.deleted} dryRun=${results.dryRun} unmatched=${results.unmatched} failed=${results.failed}`,
+  );
   if (results.deleted) console.log("Deleted photos are in Google Photos Trash for 60 days.");
   await ctx.close();
   process.exit(0);
