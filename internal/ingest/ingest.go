@@ -134,15 +134,20 @@ func ensureColumns(db *sql.DB) error {
 }
 
 // exts is the set of file extensions we'll attempt to decode. HEIC/HEIF (the
-// default iPhone format that often ends up in Takeout exports) is missing
-// because Go has no pure-Go decoder for it — convert those to JPEG first.
+// default iPhone format that often ends up in Takeout exports) is decoded via
+// a shell-out to libheif or sips — see heic.go.
 var exts = map[string]bool{
 	".jpg":  true,
 	".jpeg": true,
 	".png":  true,
 	".gif":  true,
 	".webp": true,
+	".heic": true,
+	".heif": true,
 }
+
+// heicExts identifies files that need the external converter.
+var heicExts = map[string]bool{".heic": true, ".heif": true}
 
 // record is a fully computed row handed from a worker to the DB writer.
 type record struct {
@@ -291,7 +296,12 @@ func processOne(path string, prior map[string]existing) (record, bool, error) {
 		return record{}, false, err
 	}
 
-	img, _, err := image.Decode(f)
+	var img image.Image
+	if heicExts[strings.ToLower(filepath.Ext(path))] {
+		img, err = decodeHEIC(path)
+	} else {
+		img, _, err = image.Decode(f)
+	}
 	if err != nil {
 		return record{}, false, err
 	}

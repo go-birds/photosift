@@ -126,10 +126,11 @@ Category 4 ("useless content") has two ML paths and you can use either:
 ## A note on HEIC
 
 iPhone's default `.heic`/`.heif` format has no pure-Go decoder, so photosift
-skips those files (they show up in the `scanned ... could not be decoded` count
-at the end of a scan). Convert them to JPEG first if you want them analysed,
-e.g. with `sips -s format jpeg *.heic --out converted/` on macOS or
-`heif-convert` from `libheif`.
+shells out to whichever converter is installed: `heif-convert` from
+[libheif](https://github.com/strukturag/libheif) (`brew install libheif`,
+`apt install libheif-examples`) or the `sips` tool that ships with macOS.
+If neither is installed, HEIC files are counted as "could not be decoded" and
+photosift prints a one-shot install hint.
 
 ## Performance
 
