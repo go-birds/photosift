@@ -5,7 +5,9 @@ module github.com/go-birds/photosift
 go 1.25.0
 
 require (
+	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/spf13/cobra v1.7.0
+	github.com/yalue/onnxruntime_go v1.30.1
 	golang.org/x/image v0.41.0
 	modernc.org/sqlite v1.44.3
 )
@@ -18,7 +20,6 @@ require (
 	github.com/ncruces/go-strftime v1.0.0 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	github.com/spf13/pflag v1.0.5 // indirect
-	github.com/yalue/onnxruntime_go v1.30.1 // indirect
 	golang.org/x/exp v0.0.0-20251023183803-a4bb9ffd2546 // indirect
 	golang.org/x/sys v0.37.0 // indirect
 	modernc.org/libc v1.67.6 // indirect

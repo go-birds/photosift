@@ -21,16 +21,22 @@ import (
 	"time"
 
 	"github.com/go-birds/photosift/internal/analyze"
+	lru "github.com/hashicorp/golang-lru/v2"
 	"golang.org/x/image/draw"
 )
 
 //go:embed web
 var webFS embed.FS
 
+// thumbCacheSize bounds the in-memory thumbnail cache. 512 * ~6KB jpeg ≈ 3 MB
+// resident — enough to keep an entire review session hot without blowing up
+// on a 100k-photo library.
+const thumbCacheSize = 512
+
 // Server holds the dependencies for the review UI.
 type Server struct {
 	db        *sql.DB
-	thumbs    sync.Map // id -> []byte (jpeg)
+	thumbs    *lru.Cache[int64, []byte] // bounded; persistent copy lives in DB
 	thumbSide int
 
 	// SSE subscribers fanning out summary updates whenever a decision
@@ -41,7 +47,13 @@ type Server struct {
 
 // New builds a server backed by the given database handle.
 func New(db *sql.DB) *Server {
-	return &Server{db: db, thumbSide: 320, subs: map[chan struct{}]struct{}{}}
+	cache, _ := lru.New[int64, []byte](thumbCacheSize)
+	return &Server{
+		db:        db,
+		thumbs:    cache,
+		thumbSide: 320,
+		subs:      map[chan struct{}]struct{}{},
+	}
 }
 
 func (s *Server) subscribe() chan struct{} {
@@ -277,16 +289,16 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not found", 404)
 		return
 	}
-	if cached, ok := s.thumbs.Load(id); ok {
+	if cached, ok := s.thumbs.Get(id); ok {
 		w.Header().Set("Content-Type", "image/jpeg")
-		w.Write(cached.([]byte))
+		w.Write(cached)
 		return
 	}
 
 	// First try the thumbs table populated at scan time.
 	var blob []byte
 	if err := s.db.QueryRow(`SELECT jpeg FROM thumbs WHERE image_id = ?`, id).Scan(&blob); err == nil {
-		s.thumbs.Store(id, blob)
+		s.thumbs.Add(id, blob)
 		w.Header().Set("Content-Type", "image/jpeg")
 		w.Write(blob)
 		return
@@ -300,7 +312,7 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_, _ = s.db.Exec(`INSERT OR REPLACE INTO thumbs(image_id, jpeg) VALUES (?, ?)`, id, buf)
-	s.thumbs.Store(id, buf)
+	s.thumbs.Add(id, buf)
 	w.Header().Set("Content-Type", "image/jpeg")
 	w.Write(buf)
 }
