@@ -68,12 +68,36 @@ cd automation && npm install && node delete.mjs --manifest ../photosift-delete.j
 | `scan`    | Index image files; computes hashes + quality metrics.          |
 | `analyze` | Score images and write deletion suggestions.                   |
 | `tag`     | Import semantic content labels from the ML pass.               |
+| `ml`      | Go-native ML labelling (opt-in build, MobileNetV2 via ONNX).   |
 | `serve`   | Local review UI (the desktop app).                             |
 | `export`  | Write the delete manifest (confirmed deletions, or all).       |
 | `dupes`   | Quick CLI listing of exact duplicates.                         |
 
 Useful flags: `analyze --near-dist`, `--subject-min`, `--blur-threshold`;
 `serve --addr`; all commands take `--db`.
+
+## ML pipelines
+
+Category 4 ("useless content") has two ML paths and you can use either:
+
+- **`ml/classify.py`** (default — works out of the box). Zero-shot CLIP via
+  Python with prompt-engineered buckets. Higher accuracy on store/product
+  scenes; requires `pip install open_clip_torch pillow torch`. Writes a JSON
+  imported with `photosift tag`.
+- **`photosift ml`** (Go-native, opt-in build). MobileNetV2 ImageNet classifier
+  via [onnxruntime_go](https://github.com/yalue/onnxruntime_go) dlopen'd at
+  run time. Less semantic coverage (1000 fixed classes vs free-form prompts)
+  but no Python dependency and one less moving part.
+
+  ```bash
+  # one-time: install the ONNX runtime shared library and point at it
+  #   macOS:  brew install onnxruntime
+  #   linux:  apt install libonnxruntime-dev   (or build from source)
+  go build -tags onnx -o photosift ./cmd/photosift
+  PHOTOSIFT_ONNX_LIB=/usr/local/lib/libonnxruntime.so \
+    ./photosift ml          # auto-downloads model + labels on first run
+  ./photosift analyze       # now uses the ML labels for category 4
+  ```
 
 ## A note on HEIC
 
