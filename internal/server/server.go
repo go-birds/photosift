@@ -230,8 +230,9 @@ func (s *Server) handleGroups(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 
 	// Cluster 0 means "no cluster" (e.g. low quality); each such image is its
-	// own single-item group.
-	var groups []groupDTO
+	// own single-item group. Initialised non-nil so an empty result encodes as
+	// JSON [] instead of null.
+	groups := []groupDTO{}
 	byCluster := map[int64]int{} // cluster_id -> index into groups
 	singleSeq := int64(-1)
 

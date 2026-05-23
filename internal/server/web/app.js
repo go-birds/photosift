@@ -48,7 +48,7 @@ function basename(p) {
   return i >= 0 ? p.slice(i + 1) : p;
 }
 
-function makeCard(img) {
+function makeCard(img, group) {
   const card = document.createElement("div");
   card.className = "card";
   if (img.decision === "delete") card.classList.add("delete");
@@ -59,7 +59,7 @@ function makeCard(img) {
   const im = document.createElement("img");
   im.loading = "lazy";
   im.src = `/api/thumb/${img.id}`;
-  im.onclick = () => showLightbox(img.id);
+  im.onclick = () => showLightbox(group, group.images.indexOf(img));
   wrap.appendChild(im);
   card.appendChild(wrap);
 
@@ -142,7 +142,7 @@ async function loadGroups() {
     }
     const grid = document.createElement("div");
     grid.className = "grid";
-    for (const img of g.images) grid.appendChild(makeCard(img));
+    for (const img of g.images) grid.appendChild(makeCard(img, g));
     div.appendChild(grid);
     container.appendChild(div);
   }
@@ -152,17 +152,33 @@ async function loadSummary() {
   applySummary(await getJSON("/api/summary"));
 }
 
-function showLightbox(id) {
-  const lb = document.getElementById("lightbox");
-  document.getElementById("lightbox-img").src = `/api/image/${id}`;
-  lb.classList.remove("hidden");
+// Lightbox keeps its current group + index so arrow keys can flip through the
+// cluster without closing the overlay.
+const lightbox = { group: null, index: 0 };
+
+function showLightbox(group, index) {
+  lightbox.group = group;
+  lightbox.index = index;
+  renderLightbox();
+  document.getElementById("lightbox").classList.remove("hidden");
+}
+
+function renderLightbox() {
+  if (!lightbox.group) return;
+  const img = lightbox.group.images[lightbox.index];
+  document.getElementById("lightbox-img").src = `/api/image/${img.id}`;
 }
 
 function closeLightbox() {
   document.getElementById("lightbox").classList.add("hidden");
   document.getElementById("lightbox-img").src = "";
+  lightbox.group = null;
 }
 document.getElementById("lightbox").onclick = closeLightbox;
+
+function lightboxIsOpen() {
+  return !document.getElementById("lightbox").classList.contains("hidden");
+}
 
 /* ---------------- Review mode ---------------- */
 //
@@ -216,7 +232,7 @@ function renderReview() {
   }
   const grid = document.createElement("div");
   grid.className = "grid";
-  for (const img of g.images) grid.appendChild(makeCard(img));
+  for (const img of g.images) grid.appendChild(makeCard(img, g));
   wrap.appendChild(grid);
   slot.appendChild(wrap);
 
@@ -292,6 +308,23 @@ document.addEventListener("keydown", async (e) => {
     closeLightbox();
     if (review.active) exitReview();
     return;
+  }
+  // Lightbox open: arrow keys flip within the current cluster instead of
+  // navigating clusters in review mode.
+  if (lightboxIsOpen() && lightbox.group) {
+    if (e.key === "ArrowRight") {
+      e.preventDefault();
+      lightbox.index = (lightbox.index + 1) % lightbox.group.images.length;
+      renderLightbox();
+      return;
+    }
+    if (e.key === "ArrowLeft") {
+      e.preventDefault();
+      lightbox.index =
+        (lightbox.index - 1 + lightbox.group.images.length) % lightbox.group.images.length;
+      renderLightbox();
+      return;
+    }
   }
   if (!review.active) return;
   // ignore keystrokes while typing in inputs (none today but defensive).
