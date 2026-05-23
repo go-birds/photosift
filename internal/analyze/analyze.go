@@ -30,7 +30,8 @@ type Options struct {
 	DarkThreshold   float64 // mean brightness below this is "too dark"
 	BrightThreshold float64 // mean brightness above this is "blown out"
 	Classifier      Classifier
-	NoLearn         bool // disable threshold adjustment from user decisions
+	NoLearn         bool       // disable threshold adjustment from user decisions
+	Overrides       *Resolver  // per-album threshold overrides (nil = none)
 }
 
 func (o *Options) applyDefaults() {
@@ -57,6 +58,9 @@ func (o *Options) applyDefaults() {
 	}
 	if o.Classifier == nil {
 		o.Classifier = DefaultHeuristic()
+	}
+	if o.Overrides == nil {
+		o.Overrides = &Resolver{}
 	}
 }
 
@@ -223,19 +227,23 @@ func detectOvershoot(imgs []index.Image, idx *hashIndex, opts Options, out *[]Su
 
 func detectLowQuality(imgs []index.Image, opts Options, out *[]Suggestion) {
 	for _, img := range imgs {
+		ov := opts.Overrides.For(img.Path)
+		blur := effectiveBlur(ov, opts.BlurThreshold)
+		dark := effectiveDark(ov, opts.DarkThreshold)
+		bright := effectiveBright(ov, opts.BrightThreshold)
 		switch {
-		case img.BlurVar > 0 && img.BlurVar < opts.BlurThreshold:
-			score := clamp01((opts.BlurThreshold - img.BlurVar) / opts.BlurThreshold)
+		case img.BlurVar > 0 && img.BlurVar < blur:
+			score := clamp01((blur - img.BlurVar) / blur)
 			*out = append(*out, Suggestion{
 				ImageID: img.ID, Category: CatLowQuality, Score: score,
 				Reason: fmt.Sprintf("blurry / soft focus (sharpness %.0f)", img.BlurVar),
 			})
-		case img.Brightness > 0 && img.Brightness < opts.DarkThreshold:
+		case img.Brightness > 0 && img.Brightness < dark:
 			*out = append(*out, Suggestion{
 				ImageID: img.ID, Category: CatLowQuality, Score: 0.7,
 				Reason: fmt.Sprintf("very dark (brightness %.0f)", img.Brightness),
 			})
-		case img.Brightness > opts.BrightThreshold:
+		case img.Brightness > bright:
 			*out = append(*out, Suggestion{
 				ImageID: img.ID, Category: CatLowQuality, Score: 0.7,
 				Reason: fmt.Sprintf("over-exposed (brightness %.0f)", img.Brightness),
@@ -245,8 +253,18 @@ func detectLowQuality(imgs []index.Image, opts Options, out *[]Suggestion) {
 }
 
 func detectUseless(imgs []index.Image, opts Options, out *[]Suggestion) {
+	// Resolve the global default threshold once — overrides may still bump it
+	// per image.
+	defaultThreshold := 0.45
+	if hc, ok := opts.Classifier.(HeuristicClassifier); ok {
+		defaultThreshold = hc.Threshold
+	}
 	for _, img := range imgs {
 		label, score, useless := opts.Classifier.Classify(img)
+		if ov := opts.Overrides.For(img.Path); ov.UselessThreshold != nil {
+			// Re-evaluate with the per-album threshold.
+			useless = uselessBuckets[label] && score >= effectiveUseless(ov, defaultThreshold)
+		}
 		if useless {
 			*out = append(*out, Suggestion{
 				ImageID: img.ID, Category: CatUseless, Score: score,

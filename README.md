@@ -73,8 +73,32 @@ cd automation && npm install && node delete.mjs --manifest ../photosift-delete.j
 | `export`  | Write the delete manifest (confirmed deletions, or all).       |
 | `dupes`   | Quick CLI listing of exact duplicates.                         |
 
-Useful flags: `analyze --near-dist`, `--subject-min`, `--blur-threshold`;
-`serve --addr`; all commands take `--db`.
+Useful flags: `analyze --near-dist`, `--subject-min`, `--blur-threshold`,
+`--overrides`, `--no-learn`; `serve --addr`; all commands take `--db`.
+
+## Per-album threshold overrides
+
+A nature album shot at golden hour has different priors than a folder of
+photos-of-shopping-receipts. Pass `--overrides overrides.json` to
+`photosift analyze`:
+
+```json
+[
+  {"prefix": "/photos/Italy 2024",  "blur_threshold": 80},
+  {"prefix": "/photos/screenshots", "useless_threshold": 0.3, "blur_threshold": 30}
+]
+```
+
+The longest matching prefix wins, so narrow rules can nest inside broad ones.
+Unset fields inherit the global thresholds. Clustering radii are global.
+
+## Learning from your decisions
+
+After you review and mark some suggestions, the next `photosift analyze`
+notices which categories you've been overriding and tightens those thresholds.
+The trigger is conservative — at least 20 decisions in a category, and over
+half marked "keep" — so a few clicks won't move things. Pass `--no-learn` to
+disable.
 
 ## ML pipelines
 
