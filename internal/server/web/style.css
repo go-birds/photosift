@@ -154,7 +154,7 @@ main { padding: 16px 24px 60px; }
 .actions a.open { color: var(--accent); align-self: center; font-size: 11px; text-decoration: none; padding: 0 4px; }
 
 .empty { color: var(--muted); padding: 40px; text-align: center; }
-.hidden { display: none; }
+.hidden { display: none !important; }
 
 .lightbox {
   position: fixed; inset: 0;
@@ -164,3 +164,48 @@ main { padding: 16px 24px 60px; }
   z-index: 50;
 }
 .lightbox img { max-width: 92vw; max-height: 92vh; border-radius: 6px; }
+
+/* Review mode — one cluster at a time, keyboard-driven */
+#review-panel { padding-bottom: 60px; }
+.review-progress {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-bottom: 16px;
+}
+.review-progress #review-pos { color: var(--muted); font-size: 13px; min-width: 120px; }
+.review-bar {
+  flex: 1;
+  height: 6px;
+  background: var(--panel);
+  border-radius: 3px;
+  overflow: hidden;
+}
+#review-bar-fill {
+  height: 100%;
+  background: var(--accent);
+  width: 0%;
+  transition: width 200ms ease;
+}
+#review-cluster .group { padding: 22px; }
+#review-cluster .grid {
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+}
+#review-cluster .thumb-wrap { aspect-ratio: 4 / 3; }
+.review-help {
+  margin-top: 18px;
+  color: var(--muted);
+  font-size: 12px;
+  text-align: center;
+}
+.review-help kbd {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  padding: 1px 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  color: var(--text);
+  margin: 0 1px;
+}

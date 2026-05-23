@@ -18,11 +18,28 @@
     <div id="toolbar" class="toolbar">
       <span id="count" class="count"></span>
       <div class="spacer"></div>
+      <button id="review-toggle" class="btn">Review one at a time ⌨︎</button>
       <button id="select-all" class="btn">Mark all suggestions for deletion</button>
       <a id="export-csv" class="btn" href="/api/export.csv">Export CSV</a>
       <a id="export-json" class="btn" href="/api/export.json">Export JSON</a>
     </div>
     <div id="groups"></div>
+    <div id="review-panel" class="hidden">
+      <div class="review-progress">
+        <span id="review-pos"></span>
+        <div class="review-bar"><div id="review-bar-fill"></div></div>
+        <button id="review-exit" class="btn">Done</button>
+      </div>
+      <div id="review-cluster"></div>
+      <div class="review-help">
+        <kbd>Space</kbd> accept default ·
+        <kbd>K</kbd> keep all ·
+        <kbd>D</kbd> delete non-keepers ·
+        <kbd>←</kbd> / <kbd>→</kbd> nav ·
+        <kbd>U</kbd> undo ·
+        <kbd>Esc</kbd> exit
+      </div>
+    </div>
     <div id="empty" class="empty hidden">No suggestions in this category.</div>
   </main>
 
