@@ -1,0 +1,17 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "PhotoSift",
+  "outputfilename": "PhotoSift",
+  "frontend:install": "",
+  "frontend:build": "",
+  "frontend:dev:watcher": "",
+  "frontend:dev:serverUrl": "",
+  "author": {
+    "name": "go-birds"
+  },
+  "info": {
+    "companyName": "go-birds",
+    "productName": "PhotoSift",
+    "productIdentifier": "com.gobirds.photosift"
+  }
+}
