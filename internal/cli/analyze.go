@@ -23,7 +23,10 @@ func init() {
 	analyzeCmd.Flags().IntVar(&anNearDist, "near-dist", 6, "max Hamming distance for near-duplicates")
 	analyzeCmd.Flags().IntVar(&anSubjectMin, "subject-min", 5, "group size that counts as too many photos of one subject")
 	analyzeCmd.Flags().Float64Var(&anBlur, "blur-threshold", 120, "sharpness below this is flagged blurry")
+	analyzeCmd.Flags().BoolVar(&anNoLearn, "no-learn", false, "do not adjust thresholds from past user decisions")
 }
+
+var anNoLearn bool
 
 var analyzeCmd = &cobra.Command{
 	Use:   "analyze",
@@ -41,11 +44,15 @@ var analyzeCmd = &cobra.Command{
 			NearDist:      anNearDist,
 			SubjectMin:    anSubjectMin,
 			BlurThreshold: anBlur,
+			NoLearn:       anNoLearn,
 		})
 		if err != nil {
 			return err
 		}
 
+		for _, line := range sum.FeedbackLog {
+			fmt.Printf("learned: %s\n", line)
+		}
 		fmt.Printf("analyzed %d images in %s\n", sum.Total, time.Since(start))
 		cats := make([]string, 0, len(sum.Counts))
 		for c := range sum.Counts {

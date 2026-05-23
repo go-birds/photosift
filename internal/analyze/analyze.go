@@ -30,6 +30,7 @@ type Options struct {
 	DarkThreshold   float64 // mean brightness below this is "too dark"
 	BrightThreshold float64 // mean brightness above this is "blown out"
 	Classifier      Classifier
+	NoLearn         bool // disable threshold adjustment from user decisions
 }
 
 func (o *Options) applyDefaults() {
@@ -72,13 +73,22 @@ type Suggestion struct {
 // Summary is a per-category count of deletion candidates (keepers excluded).
 type Summary struct {
 	Counts          map[string]int
-	CandidateImages int // distinct images suggested for deletion
-	Total           int // images analysed
+	CandidateImages int      // distinct images suggested for deletion
+	Total           int      // images analysed
+	FeedbackLog     []string // adjustments learned from user decisions, if any
 }
 
 // Run analyses every indexed image and rewrites the suggestions table.
 func Run(db *sql.DB, opts Options) (Summary, error) {
 	opts.applyDefaults()
+
+	var feedbackLog []string
+	if !opts.NoLearn {
+		log, err := applyFeedback(db, &opts)
+		if err == nil {
+			feedbackLog = log
+		}
+	}
 
 	imgs, err := index.LoadAllImages(db)
 	if err != nil {
@@ -109,6 +119,7 @@ func Run(db *sql.DB, opts Options) (Summary, error) {
 		candidates[s.ImageID] = true
 	}
 	sum.CandidateImages = len(candidates)
+	sum.FeedbackLog = feedbackLog
 	return sum, nil
 }
 
